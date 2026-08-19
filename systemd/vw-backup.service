@@ -1,0 +1,17 @@
+[Unit]
+Description=Vaultwarden encrypted backup
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vw-backup.sh
+User=root
+Group=root
+UMask=0077
+TimeoutStartSec=0
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+ReadWritePaths=/etc/vaultwarden/rclone /opt/vaultwarden /var/lib/vaultwarden /run/lock

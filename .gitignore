@@ -1,0 +1,21 @@
+# Local credentials and runtime configuration
+*.env
+*.env.*
+rclone.conf
+*.secret
+
+# Backup and restore artifacts
+*.tar.gz
+*.sha256
+*.manifest.json
+restore/
+backup-staging/
+data/
+data.pre-restore.*
+data.failed-restore.*
+
+# Local logs and editor metadata
+*.log
+.DS_Store
+.vscode/
+.idea/
