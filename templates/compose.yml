@@ -9,3 +9,9 @@ services:
       - /opt/vaultwarden/data:/data
     ports:
       - "127.0.0.1:8080:80"
+    healthcheck:
+      test: ["CMD", "/healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

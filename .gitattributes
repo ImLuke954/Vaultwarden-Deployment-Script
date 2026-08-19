@@ -5,3 +5,4 @@
 *.yaml text eol=lf
 *.md text eol=lf
 *.conf text eol=lf
+templates/logrotate-vaultwarden text eol=lf

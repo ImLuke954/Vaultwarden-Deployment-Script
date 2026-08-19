@@ -18,6 +18,13 @@ NGINX_SITE=/etc/nginx/sites-available/vaultwarden.conf
 NGINX_LINK=/etc/nginx/sites-enabled/vaultwarden.conf
 CERTBOT_HOOK=/etc/letsencrypt/renewal-hooks/deploy/vaultwarden-nginx-reload
 PUBLIC_CHECK_API=https://check-host.net
+CLOUDFLARE_ENV=$ETC_DIR/cloudflare.env
+FAIL2BAN_JAIL=/etc/fail2ban/jail.d/vaultwarden.local
+FAIL2BAN_FILTER=/etc/fail2ban/filter.d/vaultwarden.conf
+FAIL2BAN_ADMIN_FILTER=/etc/fail2ban/filter.d/vaultwarden-admin.conf
+FAIL2BAN_TOTP_FILTER=/etc/fail2ban/filter.d/vaultwarden-totp.conf
+FAIL2BAN_ACTION=/etc/fail2ban/action.d/cloudflare-token.conf
+LOGROTATE_FILE=/etc/logrotate.d/vaultwarden
 
 MODE=
 DOMAIN=
@@ -44,7 +51,14 @@ RESTORE_NEW_CONTAINER_ATTEMPTED=0
 RESTORE_ROLLBACK_DIR=
 RESTORE_CONFIG_ROLLBACK_DIR=
 RESTORE_NGINX_ROLLBACK_DIR=
+RESTORE_SECURITY_ROLLBACK_DIR=
+RESTORE_FAIL2BAN_WAS_ACTIVE=0
+RESTORE_FAIL2BAN_WAS_ENABLED=0
+RESTORE_FAIL2BAN_STATE_CAPTURED=0
 RESTORE_COMMITTED=0
+CLOUDFLARE_ZONE_ID=
+CLOUDFLARE_API_TOKEN=
+CLOUDFLARE_CONFIG_RESUMED=0
 
 usage() {
     cat <<'USAGE'
@@ -62,6 +76,7 @@ Options:
   --backup-prefix PATH       Path below the Crypt remote
   --retention COUNT          Number of remote archives to keep (default: 30)
   --backup NAME|latest       Archive to restore
+  --cloudflare-zone-id ID   Cloudflare zone for Fail2Ban bans
   --resume                   Reuse existing deployment settings where possible
   --dry-run                  Print the selected operation and exit
   -h, --help                 Show this help
@@ -118,6 +133,7 @@ cleanup() {
         fi
         restore_previous_files || true
         restore_previous_nginx || true
+        restore_previous_security || true
         current_container_id=$(docker inspect -f '{{.Id}}' vaultwarden 2>/dev/null || true)
         if [[ "$RESTORE_OLD_PRESENT" == 1 && -n "$current_container_id" && \
               ( -z "$RESTORE_OLD_CONTAINER_ID" || \
@@ -181,6 +197,11 @@ parse_args() {
             --backup)
                 (($# >= 2)) || die "--backup requires a name or latest"
                 BACKUP_SELECTION=$2
+                shift 2
+                ;;
+            --cloudflare-zone-id)
+                (($# >= 2)) || die "--cloudflare-zone-id requires a value"
+                CLOUDFLARE_ZONE_ID=$2
                 shift 2
                 ;;
             --resume)
@@ -275,6 +296,14 @@ prompt_value() {
     printf -v "$variable" '%s' "$value"
 }
 
+prompt_secret() {
+    local variable=$1 prompt=$2 value
+    read -r -s -p "$prompt: " value
+    printf '\n'
+    [[ -n "$value" ]] || die "$variable is required"
+    printf -v "$variable" '%s' "$value"
+}
+
 confirm() {
     local answer
     read -r -p "$1 [y/N]: " answer
@@ -301,17 +330,24 @@ load_resume_settings() {
 
     local cli_domain=$DOMAIN cli_email=$LETSENCRYPT_EMAIL cli_tag=$IMAGE_TAG
     local cli_remote=$RCLONE_REMOTE cli_prefix=$BACKUP_PREFIX cli_retention=$BACKUP_RETENTION
-    local cli_retention_set=$RETENTION_SET
+    local cli_cloudflare_zone=$CLOUDFLARE_ZONE_ID cli_retention_set=$RETENTION_SET
     # This file is created by this script and is root-only. It contains no
     # shell metacharacters because all values are validated before writing.
     # shellcheck disable=SC1090
     source "$INSTALL_ENV"
     BACKUP_PREFIX_RESUMED=1
+    if [[ -r "$CLOUDFLARE_ENV" ]]; then
+        # This file is created by this script and is root-only.
+        # shellcheck disable=SC1090
+        source "$CLOUDFLARE_ENV"
+        CLOUDFLARE_CONFIG_RESUMED=1
+    fi
     [[ -n "$cli_domain" ]] && DOMAIN=$cli_domain
     [[ -n "$cli_email" ]] && LETSENCRYPT_EMAIL=$cli_email
     [[ -n "$cli_tag" ]] && IMAGE_TAG=$cli_tag
     [[ -n "$cli_remote" ]] && RCLONE_REMOTE=$cli_remote
     [[ -n "$cli_prefix" ]] && BACKUP_PREFIX=$cli_prefix
+    [[ -n "$cli_cloudflare_zone" ]] && CLOUDFLARE_ZONE_ID=$cli_cloudflare_zone
     if [[ "$cli_retention_set" == 1 ]]; then
         BACKUP_RETENTION=$cli_retention
         RETENTION_SET=1
@@ -353,6 +389,25 @@ collect_settings() {
     [[ "$BACKUP_RETENTION" =~ ^[1-9][0-9]*$ ]] || die "retention must be a positive integer"
 }
 
+collect_security_settings() {
+    local zone
+    if [[ "$CLOUDFLARE_CONFIG_RESUMED" == 0 && -z "$CLOUDFLARE_ZONE_ID" && -t 0 ]]; then
+        read -r -p 'Cloudflare Zone ID (blank for local firewall bans): ' zone
+        CLOUDFLARE_ZONE_ID=$zone
+    fi
+    if [[ -z "$CLOUDFLARE_ZONE_ID" ]]; then
+        [[ -z "$CLOUDFLARE_API_TOKEN" ]] || die 'Cloudflare API token requires a zone ID'
+        return 0
+    fi
+    [[ "$CLOUDFLARE_ZONE_ID" =~ ^[A-Fa-f0-9]{32}$ ]] || die 'Cloudflare Zone ID must be 32 hexadecimal characters'
+    if [[ -z "$CLOUDFLARE_API_TOKEN" ]]; then
+        [[ -t 0 ]] || die 'a Cloudflare API token is required when --cloudflare-zone-id is used'
+        prompt_secret CLOUDFLARE_API_TOKEN 'Cloudflare API token'
+    fi
+    [[ "$CLOUDFLARE_API_TOKEN" =~ ^[A-Za-z0-9._-]{20,256}$ ]] || \
+        die 'Cloudflare API token contains invalid characters or length'
+}
+
 preflight() {
     [[ "$EUID" -eq 0 ]] || die "run this script as root, for example: sudo $0"
     [[ -r /etc/os-release ]] || die 'cannot identify operating system'
@@ -366,6 +421,15 @@ preflight() {
     esac
     command -v apt-get >/dev/null || die 'apt-get is required'
     command -v flock >/dev/null || die 'flock is required; install util-linux first'
+    if [[ "$MODE" == restore ]]; then
+        if systemctl is-active --quiet fail2ban 2>/dev/null; then
+            RESTORE_FAIL2BAN_WAS_ACTIVE=1
+        fi
+        if systemctl is-enabled --quiet fail2ban 2>/dev/null; then
+            RESTORE_FAIL2BAN_WAS_ENABLED=1
+        fi
+        RESTORE_FAIL2BAN_STATE_CAPTURED=1
+    fi
     local free_kb
     free_kb=$(df -Pk / | awk 'NR == 2 { print $4 }')
     [[ "$free_kb" =~ ^[0-9]+$ && "$free_kb" -ge 5242880 ]] || \
@@ -380,8 +444,8 @@ install_packages() {
     log 'installing required packages'
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y ca-certificates curl docker.io nginx certbot \
-        python3-certbot-nginx rclone sqlite3 jq tar gzip coreutils util-linux
+    apt-get install -y ca-certificates curl docker.io nginx certbot fail2ban logrotate \
+        python3-certbot-nginx python3-pyinotify rclone sqlite3 jq tar gzip coreutils util-linux
 
     systemctl enable --now docker
     systemctl enable --now nginx
@@ -488,9 +552,126 @@ SIGNUPS_ALLOWED=false
 SHOW_PASSWORD_HINT=false
 WEBSOCKET_ENABLED=true
 ROCKET_ADDRESS=0.0.0.0
-LOG_LEVEL=warn
+IP_HEADER=X-Real-IP
+IP_HEADER_TRUSTED_PROXIES=local
+EXTENDED_LOGGING=true
+LOG_FILE=/data/vaultwarden.log
+LOG_LEVEL=info
 EOF
     chmod 0600 "$VAULTWARDEN_ENV"
+}
+
+write_cloudflare_env() {
+    if [[ -z "$CLOUDFLARE_ZONE_ID" ]]; then
+        [[ "$CLOUDFLARE_CONFIG_RESUMED" == 1 ]] || rm -f -- "$CLOUDFLARE_ENV"
+        return 0
+    fi
+    {
+        printf 'CLOUDFLARE_ZONE_ID=%q\n' "$CLOUDFLARE_ZONE_ID"
+        printf 'CLOUDFLARE_API_TOKEN=%q\n' "$CLOUDFLARE_API_TOKEN"
+    } > "$CLOUDFLARE_ENV"
+    chmod 0600 "$CLOUDFLARE_ENV"
+}
+
+ensure_vaultwarden_log() {
+    local log_file=$APP_DIR/data/vaultwarden.log
+    [[ ! -L "$log_file" ]] || die 'Vaultwarden log path must not be a symlink'
+    if [[ ! -e "$log_file" ]]; then
+        install -m 0600 /dev/null "$log_file"
+    fi
+}
+
+validate_cloudflare_credentials() {
+    local response
+    [[ -n "$CLOUDFLARE_ZONE_ID" ]] || return 0
+    response=$(curl --noproxy '*' -fsS --max-time 20 \
+        -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+        -H 'Content-Type: application/json' \
+        "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/firewall/access_rules/rules?per_page=1") || \
+        die 'could not validate the Cloudflare API token or zone ID'
+    jq -e '.success == true' <<< "$response" >/dev/null || \
+        die 'Cloudflare API token cannot access zone firewall rules'
+}
+
+write_fail2ban_jail() {
+    local temporary action
+    temporary=$(mktemp "$STAGE_DIR/fail2ban-jail.XXXXXX")
+    if [[ -n "$CLOUDFLARE_ZONE_ID" ]]; then
+        action=cloudflare-token
+    else
+        action='%(action_)s'
+    fi
+    cat > "$temporary" <<EOF
+[DEFAULT]
+bantime = 4h
+findtime = 10m
+maxretry = 3
+backend = pyinotify
+action = $action
+EOF
+    if [[ -n "$CLOUDFLARE_ZONE_ID" ]]; then
+        printf 'cfzone = %s\n' "$CLOUDFLARE_ZONE_ID" >> "$temporary"
+        printf 'cftoken = %s\n' "$CLOUDFLARE_API_TOKEN" >> "$temporary"
+    fi
+    cat >> "$temporary" <<'EOF'
+
+[vaultwarden]
+enabled = true
+port = 80,443
+filter = vaultwarden
+logpath = /opt/vaultwarden/data/vaultwarden.log
+
+[vaultwarden-admin]
+enabled = true
+port = 80,443
+filter = vaultwarden-admin
+logpath = /opt/vaultwarden/data/vaultwarden.log
+
+[vaultwarden-totp]
+enabled = true
+port = 80,443
+filter = vaultwarden-totp
+logpath = /opt/vaultwarden/data/vaultwarden.log
+EOF
+    install -d -m 0755 /etc/fail2ban/jail.d
+    if [[ -n "$CLOUDFLARE_ZONE_ID" ]]; then
+        install -m 0600 "$temporary" "$FAIL2BAN_JAIL"
+    else
+        install -m 0644 "$temporary" "$FAIL2BAN_JAIL"
+    fi
+    rm -f -- "$temporary"
+}
+
+install_fail2ban() {
+    [[ -f "$SCRIPT_DIR/templates/fail2ban/filter.d/vaultwarden.conf" ]] || \
+        die 'Vaultwarden Fail2Ban filter is missing'
+    [[ -f "$SCRIPT_DIR/templates/fail2ban/filter.d/vaultwarden-admin.conf" ]] || \
+        die 'Vaultwarden admin Fail2Ban filter is missing'
+    [[ -f "$SCRIPT_DIR/templates/fail2ban/filter.d/vaultwarden-totp.conf" ]] || \
+        die 'Vaultwarden TOTP Fail2Ban filter is missing'
+    [[ -f "$SCRIPT_DIR/templates/fail2ban/action.d/cloudflare-token.conf" ]] || \
+        die 'Cloudflare Fail2Ban action is missing'
+
+    validate_cloudflare_credentials
+    install -d -m 0755 /etc/fail2ban/filter.d /etc/fail2ban/action.d /etc/fail2ban/jail.d
+    install -m 0644 "$SCRIPT_DIR/templates/fail2ban/filter.d/vaultwarden.conf" "$FAIL2BAN_FILTER"
+    install -m 0644 "$SCRIPT_DIR/templates/fail2ban/filter.d/vaultwarden-admin.conf" "$FAIL2BAN_ADMIN_FILTER"
+    install -m 0644 "$SCRIPT_DIR/templates/fail2ban/filter.d/vaultwarden-totp.conf" "$FAIL2BAN_TOTP_FILTER"
+    install -m 0644 "$SCRIPT_DIR/templates/fail2ban/action.d/cloudflare-token.conf" "$FAIL2BAN_ACTION"
+    [[ -f "$SCRIPT_DIR/templates/logrotate-vaultwarden" ]] || die 'Vaultwarden logrotate configuration is missing'
+    install -m 0644 "$SCRIPT_DIR/templates/logrotate-vaultwarden" "$LOGROTATE_FILE"
+    write_fail2ban_jail
+    fail2ban-client -t >/dev/null || die 'Fail2Ban configuration validation failed'
+    systemctl enable --now fail2ban
+    fail2ban-client reload >/dev/null
+    fail2ban-client status vaultwarden >/dev/null || die 'Vaultwarden Fail2Ban jail is not available'
+    fail2ban-client status vaultwarden-admin >/dev/null || die 'Vaultwarden admin Fail2Ban jail is not available'
+    fail2ban-client status vaultwarden-totp >/dev/null || die 'Vaultwarden TOTP Fail2Ban jail is not available'
+    if [[ -n "$CLOUDFLARE_ZONE_ID" ]]; then
+        log 'Fail2Ban is configured to ban visitor IPs through Cloudflare'
+    else
+        warn 'Fail2Ban is using the local firewall; Cloudflare-proxied visitor bans require --cloudflare-zone-id'
+    fi
 }
 
 write_deployment_env() {
@@ -545,7 +726,9 @@ capture_restore_state() {
     [[ "$MODE" == restore ]] || return 0
     RESTORE_CONFIG_ROLLBACK_DIR=$STAGE_DIR/previous-config
     RESTORE_NGINX_ROLLBACK_DIR=$STAGE_DIR/previous-nginx
-    install -d -m 0700 "$RESTORE_CONFIG_ROLLBACK_DIR" "$RESTORE_NGINX_ROLLBACK_DIR"
+    RESTORE_SECURITY_ROLLBACK_DIR=$STAGE_DIR/previous-security
+    install -d -m 0700 "$RESTORE_CONFIG_ROLLBACK_DIR" "$RESTORE_NGINX_ROLLBACK_DIR" \
+        "$RESTORE_SECURITY_ROLLBACK_DIR"
 
     snapshot_restore_path "$APP_DIR/.env" app-env
     snapshot_restore_path "$COMPOSE_FILE" compose
@@ -557,6 +740,17 @@ capture_restore_state() {
     snapshot_restore_path /etc/nginx/sites-enabled/default nginx-default
     snapshot_restore_path "$CERTBOT_HOOK" certbot-hook
     RESTORE_CONFIG_ROLLBACK_DIR=$STAGE_DIR/previous-config
+
+    RESTORE_CONFIG_ROLLBACK_DIR=$RESTORE_SECURITY_ROLLBACK_DIR
+    snapshot_restore_path "$CLOUDFLARE_ENV" cloudflare-env
+    snapshot_restore_path "$FAIL2BAN_JAIL" fail2ban-jail
+    snapshot_restore_path "$FAIL2BAN_FILTER" fail2ban-filter
+    snapshot_restore_path "$FAIL2BAN_ADMIN_FILTER" fail2ban-admin-filter
+    snapshot_restore_path "$FAIL2BAN_TOTP_FILTER" fail2ban-totp-filter
+    snapshot_restore_path "$FAIL2BAN_ACTION" fail2ban-action
+    snapshot_restore_path "$LOGROTATE_FILE" logrotate
+    RESTORE_CONFIG_ROLLBACK_DIR=$STAGE_DIR/previous-config
+
 
     if container_present vaultwarden; then
         RESTORE_OLD_PRESENT=1
@@ -591,10 +785,60 @@ restore_previous_nginx() {
     fi
 }
 
+restore_previous_security() {
+    if [[ -n "$RESTORE_SECURITY_ROLLBACK_DIR" && -d "$RESTORE_SECURITY_ROLLBACK_DIR" ]]; then
+        RESTORE_CONFIG_ROLLBACK_DIR=$RESTORE_SECURITY_ROLLBACK_DIR
+        restore_snapshot_path "$CLOUDFLARE_ENV" cloudflare-env
+        restore_snapshot_path "$FAIL2BAN_JAIL" fail2ban-jail
+        restore_snapshot_path "$FAIL2BAN_FILTER" fail2ban-filter
+        restore_snapshot_path "$FAIL2BAN_ADMIN_FILTER" fail2ban-admin-filter
+        restore_snapshot_path "$FAIL2BAN_TOTP_FILTER" fail2ban-totp-filter
+        restore_snapshot_path "$FAIL2BAN_ACTION" fail2ban-action
+        restore_snapshot_path "$LOGROTATE_FILE" logrotate
+        RESTORE_CONFIG_ROLLBACK_DIR=$STAGE_DIR/previous-config
+    fi
+    [[ "$RESTORE_FAIL2BAN_STATE_CAPTURED" == 1 ]] || return 0
+
+    if [[ "$RESTORE_FAIL2BAN_WAS_ACTIVE" == 1 ]]; then
+        systemctl enable --now fail2ban >/dev/null 2>&1 || true
+        fail2ban-client reload >/dev/null 2>&1 || true
+    elif [[ "$RESTORE_FAIL2BAN_WAS_ENABLED" == 1 ]]; then
+        systemctl stop fail2ban >/dev/null 2>&1 || true
+        systemctl enable fail2ban >/dev/null 2>&1 || true
+    else
+        systemctl disable --now fail2ban >/dev/null 2>&1 || true
+    fi
+}
+
 write_nginx_bootstrap() {
     local temporary
     temporary=$(mktemp /etc/nginx/vaultwarden-bootstrap.XXXXXX)
     cat > "$temporary" <<'NGINX'
+    set_real_ip_from 103.21.244.0/22;
+    set_real_ip_from 103.22.200.0/22;
+    set_real_ip_from 103.31.4.0/22;
+    set_real_ip_from 104.16.0.0/13;
+    set_real_ip_from 104.24.0.0/14;
+    set_real_ip_from 108.162.192.0/18;
+    set_real_ip_from 131.0.72.0/22;
+    set_real_ip_from 141.101.64.0/18;
+    set_real_ip_from 162.158.0.0/15;
+    set_real_ip_from 172.64.0.0/13;
+    set_real_ip_from 173.245.48.0/20;
+    set_real_ip_from 188.114.96.0/20;
+    set_real_ip_from 190.93.240.0/20;
+    set_real_ip_from 197.234.240.0/22;
+    set_real_ip_from 198.41.128.0/17;
+    set_real_ip_from 2400:cb00::/32;
+    set_real_ip_from 2606:4700::/32;
+    set_real_ip_from 2803:f800::/32;
+    set_real_ip_from 2405:b500::/32;
+    set_real_ip_from 2405:8100::/32;
+    set_real_ip_from 2a06:98c0::/29;
+    set_real_ip_from 2c0f:f248::/32;
+    real_ip_header CF-Connecting-IP;
+    real_ip_recursive on;
+
 server {
     listen 80;
     listen [::]:80;
@@ -894,13 +1138,19 @@ start_and_verify() {
         RESTORE_NEW_CONTAINER_ATTEMPTED=1
     fi
     compose -f "$COMPOSE_FILE" up -d
-    local attempt
-    for attempt in {1..30}; do
-        if curl -fsS --max-time 5 http://127.0.0.1:8080/alive >/dev/null; then
-            log 'Vaultwarden internal health check passed'
+    local attempt health_status
+    for attempt in {1..45}; do
+        health_status=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' \
+            vaultwarden 2>/dev/null || true)
+        if [[ "$health_status" == unhealthy ]]; then
+            die 'Vaultwarden Docker healthcheck failed; inspect docker logs vaultwarden'
+        fi
+        if [[ "$health_status" == healthy ]] && \
+           curl -fsS --max-time 5 http://127.0.0.1:8080/alive >/dev/null; then
+            log 'Vaultwarden internal and Docker health checks passed'
             break
         fi
-        [[ "$attempt" -eq 30 ]] && die 'Vaultwarden did not become healthy; inspect docker logs vaultwarden'
+        [[ "$attempt" -eq 45 ]] && die 'Vaultwarden did not become healthy; inspect docker logs vaultwarden'
         sleep 2
     done
     curl --noproxy '*' -fsS --max-time 20 \
@@ -966,8 +1216,8 @@ run_deployment() {
     select_mode
     load_resume_settings
     if [[ "$DRY_RUN" == 1 ]]; then
-        printf 'mode=%s\ndomain=%s\nimage_tag=%s\nrclone_remote=%s\nbackup_prefix=%s\n' \
-            "${MODE:-not-selected}" "$DOMAIN" "$IMAGE_TAG" "$RCLONE_REMOTE" "$BACKUP_PREFIX"
+        printf 'mode=%s\ndomain=%s\nimage_tag=%s\nrclone_remote=%s\nbackup_prefix=%s\ncloudflare_zone_id=%s\n' \
+            "${MODE:-not-selected}" "$DOMAIN" "$IMAGE_TAG" "$RCLONE_REMOTE" "$BACKUP_PREFIX" "$CLOUDFLARE_ZONE_ID"
         return 0
     fi
     preflight
@@ -975,6 +1225,7 @@ run_deployment() {
     ensure_directories
     STAGE_DIR=$(mktemp -d "$RESTORE_ROOT/deploy.XXXXXX")
     collect_settings
+    collect_security_settings
     configure_rclone
 
     if [[ "$MODE" == restore ]]; then
@@ -996,6 +1247,7 @@ run_deployment() {
     generate_admin_hash
     capture_restore_state
     write_compose_env
+    write_cloudflare_env
     write_deployment_env
     write_compose
     configure_tls
@@ -1003,9 +1255,11 @@ run_deployment() {
     if [[ "$MODE" == restore ]]; then
         install_restore_data
     fi
+    ensure_vaultwarden_log
     set_data_permissions
     write_state vaultwarden-started
     start_and_verify
+    install_fail2ban
     install_backup_units
     write_state complete
     RESTORE_COMMITTED=1

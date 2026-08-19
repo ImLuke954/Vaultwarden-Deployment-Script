@@ -17,7 +17,9 @@ The deployment is intentionally conservative:
 - `vw-deploy.sh`: interactive fresh-install and restore provisioner
 - `vw-backup.sh`: encrypted backup helper installed as `/usr/local/sbin/vw-backup.sh`
 - `templates/compose.yml`: Docker Compose service definition
-- `templates/nginx.conf`: Nginx HTTP to HTTPS redirect and reverse proxy
+- `templates/nginx.conf`: Cloudflare-aware Nginx HTTP to HTTPS redirect and reverse proxy
+- `templates/fail2ban/`: Vaultwarden filters and Cloudflare API action
+- `templates/logrotate-vaultwarden`: Vaultwarden log rotation policy
 - `systemd/vw-backup.service`: backup service unit
 - `systemd/vw-backup.timer`: daily backup timer
 - `VAULTWARDEN_AUTOMATION_PLAN.md`: architecture and implementation plan
@@ -30,10 +32,11 @@ The target must be a real Ubuntu or Debian VPS with:
 - A public DNS record for the Vaultwarden domain pointing to the VPS
 - TCP ports 80 and 443 available for Nginx and Let's Encrypt validation
 - Outbound HTTPS access to `check-host.net` for the external HTTPS reachability check
+- If Cloudflare proxying is enabled, a Cloudflare Zone ID and API token with Zone Firewall Services edit permission
 - At least 5 GiB of free root filesystem space recommended
 - A Google Drive rclone configuration containing the original Crypt remote, or permission to authenticate interactively
 
-The script installs Docker, Docker Compose, Nginx, Certbot, rclone, SQLite, jq, and supporting packages through `apt`.
+The script installs Docker, Docker Compose, Nginx, Certbot, rclone, SQLite, Fail2Ban, logrotate, jq, and supporting packages through `apt`.
 
 Do not run the provisioner on the existing production server unless you intend to modify that server. It is designed to configure a target VPS.
 
@@ -53,7 +56,7 @@ The script presents this menu:
 2. Restore from encrypted Google Drive backup
 ```
 
-The script asks for the public domain, Let's Encrypt email, pinned Vaultwarden image tag when needed, rclone Crypt remote, backup prefix, retention count, and a new admin password.
+The script asks for the public domain, Let's Encrypt email, pinned Vaultwarden image tag when needed, rclone Crypt remote, backup prefix, retention count, an optional Cloudflare Zone ID, and a new admin password. The Cloudflare API token is read without echo when a Zone ID is supplied.
 
 Before running the script, make sure the DNS record already resolves to this VPS. The script also checks DNS immediately before requesting the certificate.
 
@@ -144,8 +147,9 @@ The fresh-install flow:
 5. Pulls the pinned Vaultwarden image.
 6. Creates the Compose and Vaultwarden environment files.
 7. Obtains or reuses a Let's Encrypt certificate.
-8. Starts Vaultwarden and tests the local, normal-DNS, and externally probed HTTPS `/alive` endpoints.
-9. Installs and enables the daily encrypted backup timer.
+8. Starts Vaultwarden and verifies its Docker healthcheck plus local, normal-DNS, and externally probed HTTPS `/alive` endpoints.
+9. Installs and enables Fail2Ban, Vaultwarden authentication jails, and daily log rotation.
+10. Installs and enables the daily encrypted backup timer.
 
 ## Restore From Google Drive
 
@@ -192,7 +196,7 @@ The restore flow:
 9. Stops an existing Vaultwarden container only when data replacement is ready.
 10. Requires confirmation before replacing non-empty data.
 11. Preserves old data under `/opt/vaultwarden/data.pre-restore.TIMESTAMP`.
-12. Installs the validated data, starts the pinned image, and checks local and externally probed HTTPS health.
+12. Installs the validated data, starts the pinned image, and checks Docker, local, and externally probed HTTPS health.
 
 If the restore fails after old data has been moved but before the new deployment is committed, the script attempts to restore the previous data and restart the previous container. A failed restore copy is retained under a `data.failed-restore.TIMESTAMP` path for investigation.
 
@@ -227,6 +231,7 @@ Users keep their existing email addresses and master passwords. The master passw
 --backup-prefix PATH       Path below the Crypt remote
 --retention COUNT          Number of remote archives to retain, default 30
 --backup NAME|latest       Archive to restore
+--cloudflare-zone-id ID    Cloudflare zone used for API-backed bans
 --resume                   Reuse existing deployment settings where possible
 --dry-run                  Print selected values and exit without changes
 ```
@@ -290,6 +295,7 @@ The first scheduled backup is not forced immediately by installation. Run `sudo 
 /etc/vaultwarden/
 ├── install.env                  # Root-only deployment settings
 ├── vaultwarden.env              # Root-only container environment, includes hash
+├── cloudflare.env               # Root-only Cloudflare API credentials
 └── rclone/
     └── rclone.conf              # Root-only Google Drive/Crypt credentials
 
@@ -309,6 +315,10 @@ The first scheduled backup is not forced immediately by installation. Run `sudo 
 /etc/systemd/system/vw-backup.service
 /etc/systemd/system/vw-backup.timer
 /etc/nginx/sites-available/vaultwarden.conf
+/etc/fail2ban/jail.d/vaultwarden.local
+/etc/fail2ban/filter.d/vaultwarden*.conf
+/etc/fail2ban/action.d/cloudflare-token.conf
+/etc/logrotate.d/vaultwarden
 ```
 
 The provisioner uses `/run/lock/vaultwarden-operation.lock` to prevent backup, restore, and deployment operations from running concurrently.
@@ -317,11 +327,16 @@ The provisioner uses `/run/lock/vaultwarden-operation.lock` to prevent backup, r
 
 - Keep `/etc/vaultwarden/rclone/rclone.conf` out of Git and restrict it to mode `0600`.
 - Keep `/etc/vaultwarden/vaultwarden.env` root-only because it contains the admin token hash.
+- Keep `/etc/vaultwarden/cloudflare.env` root-only because it contains the Cloudflare API token.
+- Keep `/etc/fail2ban/jail.d/vaultwarden.local` root-only when Cloudflare bans are enabled because it contains the same token for the Fail2Ban action.
 - Do not place Crypt passwords, Google OAuth tokens, admin passwords, or backup archives in this repository.
 - The Vaultwarden container is not exposed directly to the internet.
 - The image tag is pinned to avoid an unexpected application/database migration during restore.
 - Restoring a backup does not decrypt vault contents. Users still need their own master passwords.
 - Anyone who obtains the rclone configuration and Crypt password may be able to access the encrypted backup files. Protect both independently.
+- Cloudflare-proxied bans require the Cloudflare API action; local firewall bans do not block packets arriving from Cloudflare edge IPs.
+- The script trusts `CF-Connecting-IP` only from Cloudflare's published IP ranges and forwards the resulting address through `X-Real-IP`.
+- Vaultwarden uses `IP_HEADER=X-Real-IP` and `IP_HEADER_TRUSTED_PROXIES=local`; `ROCKET_TRUSTED_PROXIES` is a legacy setting and is not used by current Vaultwarden releases.
 - Test restoring a backup on a separate VPS before relying on it for disaster recovery.
 
 ## Updating Vaultwarden
@@ -366,6 +381,26 @@ sudo curl -fsS http://127.0.0.1:8080/alive
 ```
 
 Check that the data directory is readable by the user configured in the pulled image and that `/opt/vaultwarden/data/db.sqlite3` exists after a restore.
+
+The Compose healthcheck runs `/healthcheck.sh`. Check its state with:
+
+```bash
+sudo docker inspect --format '{{.State.Health.Status}}' vaultwarden
+```
+
+### Fail2Ban or visitor IP detection fails
+
+Vaultwarden writes extended authentication logs to `/opt/vaultwarden/data/vaultwarden.log`. Inspect the jails and recent events with:
+
+```bash
+sudo fail2ban-client status
+sudo fail2ban-client status vaultwarden
+sudo fail2ban-client status vaultwarden-admin
+sudo journalctl -u fail2ban --no-pager -n 100
+sudo tail -n 50 /opt/vaultwarden/data/vaultwarden.log
+```
+
+When Cloudflare proxying is enabled, the deployment requires `--cloudflare-zone-id` or the interactive Zone ID prompt and a scoped API token. Fail2Ban then creates and removes Cloudflare firewall access rules. Without Cloudflare credentials, local firewall bans are used and do not block Cloudflare-proxied traffic.
 
 ### HTTPS or certificate issuance fails
 

@@ -7,7 +7,7 @@ Provide one Bash-based interactive provisioner for Ubuntu/Debian VPS hosts with 
 1. Fresh Vaultwarden installation
 2. Restore Vaultwarden from encrypted Google Drive backups
 
-The provisioner will install and configure Docker, Vaultwarden, Nginx, Let's Encrypt TLS, rclone, and recurring encrypted backups.
+The provisioner will install and configure Docker, Vaultwarden, Nginx, Let's Encrypt TLS, Cloudflare-aware client IP forwarding, Fail2Ban, rclone, and recurring encrypted backups.
 
 ## Architecture
 
@@ -19,7 +19,11 @@ project/
 ├── vw-backup.sh                 # Consistent backup helper
 ├── templates/
 │   ├── compose.yml
-│   └── nginx.conf
+│   ├── nginx.conf
+│   ├── logrotate-vaultwarden
+│   └── fail2ban/
+│       ├── action.d/cloudflare-token.conf
+│       └── filter.d/
 └── systemd/
     ├── vw-backup.service
     └── vw-backup.timer
@@ -30,7 +34,14 @@ The installer creates these files on the VPS:
 ```text
 /etc/vaultwarden/
 ├── install.env                  # Root-only non-secret deployment settings
+├── vaultwarden.env              # Root-only Vaultwarden environment
+├── cloudflare.env               # Root-only Cloudflare API credentials
 └── rclone/rclone.conf           # Root-only Google Drive and Crypt configuration
+
+/etc/fail2ban/
+├── jail.d/vaultwarden.local
+├── filter.d/vaultwarden*.conf
+└── action.d/cloudflare-token.conf
 
 /opt/vaultwarden/
 ├── compose.yml
@@ -51,8 +62,10 @@ The provisioner prompts for or obtains:
 - Admin token, stored only as an Argon2 hash
 - rclone Crypt remote and backup prefix
 - Backup retention count
+- Optional Cloudflare Zone ID and scoped API token for API-backed Fail2Ban bans
 
 `/etc/vaultwarden/install.env` must be mode `0600`. The rclone directory must be mode `0700` and `rclone.conf` mode `0600`.
+Cloudflare credentials must be stored separately at mode `0600` and never logged.
 
 The script invokes rclone with `--config /etc/vaultwarden/rclone/rclone.conf` so it never depends on the invoking user's home directory.
 
@@ -60,14 +73,16 @@ The script invokes rclone with `--config /etc/vaultwarden/rclone/rclone.conf` so
 
 1. Verify root or sudo access, Ubuntu/Debian support, free storage, and that ports 80 and 443 are available.
 2. Verify DNS for the requested domain before requesting a TLS certificate.
-3. Install Docker Engine and Docker Compose plugin, rclone, Nginx, Certbot, SQLite tools, and required utilities.
+3. Install Docker Engine and Docker Compose plugin, rclone, Nginx, Certbot, SQLite tools, Fail2Ban, logrotate, and required utilities.
 4. Check for `/etc/vaultwarden/rclone/rclone.conf`.
 5. If an existing rclone configuration is available, instruct the operator to place it in that location with the required permissions.
 6. If no configuration is available, run interactive `rclone config` to authorize Google Drive and configure the Crypt remote.
 7. Verify that the configured Crypt remote can list the backup prefix.
 8. Generate the Docker Compose configuration, Nginx site configuration, systemd backup service, and timer.
-9. Request the Let's Encrypt certificate, start Vaultwarden, and verify its `/alive` endpoint locally and through external HTTPS probe nodes.
-10. Enable the recurring backup timer.
+9. Configure Cloudflare real-IP ranges in Nginx and set Vaultwarden's client-IP header and trusted-proxy settings.
+10. Request the Let's Encrypt certificate, start Vaultwarden, and verify its Docker healthcheck plus `/alive` endpoint locally and through external HTTPS probe nodes.
+11. Configure Fail2Ban authentication jails and use Cloudflare API bans when credentials are supplied.
+12. Enable log rotation and the recurring backup timer.
 
 ## Mode 2: Restore From Google Drive
 
@@ -81,8 +96,9 @@ The script invokes rclone with `--config /etc/vaultwarden/rclone/rclone.conf` so
 8. Run SQLite `PRAGMA integrity_check` before installing the data.
 9. Refuse to overwrite populated data unless the operator explicitly confirms. Preserve existing data as a timestamped local rollback directory.
 10. Move the validated data into `/opt/vaultwarden/data`, apply restrictive permissions, and start the selected pinned Vaultwarden image.
-11. Verify the container status, logs, SQLite integrity, and local plus externally probed HTTPS `/alive` endpoints.
-12. Apply the requested `DOMAIN` configuration and warn that passkeys/WebAuthn registered for the old domain must be re-registered.
+11. Verify the container health status, logs, SQLite integrity, and local plus externally probed HTTPS `/alive` endpoints.
+12. Configure Fail2Ban and restore its previous configuration if the restore is not committed.
+13. Apply the requested `DOMAIN` configuration and warn that passkeys/WebAuthn registered for the old domain must be re-registered.
 
 ## Existing Backup Compatibility
 
@@ -127,13 +143,18 @@ The backup helper must:
 - Include `--dry-run`, `--mode fresh|restore`, `--backup latest|NAME`, and `--resume` options.
 - Require interactive confirmation before destructive actions, including overwriting data and deleting expired backups.
 - Validate DNS, certificate issuance, and external HTTPS reachability before declaring the deployment successful.
+- Trust `CF-Connecting-IP` only from Cloudflare's published IP ranges and forward it to Vaultwarden through `X-Real-IP`.
+- Configure Vaultwarden authentication, admin-token, and TOTP Fail2Ban jails from the root-only log file.
+- Use a Cloudflare API token action for bans when the domain is proxied through Cloudflare.
+- Define and verify a Docker healthcheck for `/healthcheck.sh`.
 
 ## Implementation Order
 
 1. Create the strict Bash framework, CLI parsing, protected configuration handling, logging, locking, and preflight checks.
 2. Add Docker, Vaultwarden Compose, Nginx, and Certbot deployment functions.
 3. Add rclone configuration detection, import guidance, interactive OAuth fallback, and remote verification.
-4. Implement the fresh-install workflow and health checks.
-5. Implement canonical backup creation, upload verification, retention, and systemd scheduling.
-6. Implement restore selection, legacy archive support, validation, rollback protection, and post-restore checks.
-7. Test fresh installation, restore from a valid current backup, checksum failure, invalid archive paths, interrupted backup restart behavior, and attempted overwrite of an existing data directory.
+4. Implement the fresh-install workflow, Cloudflare real-IP forwarding, and Docker health checks.
+5. Implement Fail2Ban filters, Cloudflare API actions, log rotation, and service validation.
+6. Implement canonical backup creation, upload verification, retention, and systemd scheduling.
+7. Implement restore selection, legacy archive support, validation, rollback protection, and post-restore checks.
+8. Test fresh installation, real visitor IP logging, Cloudflare ban/unban, Fail2Ban filters, Docker health, restore from a valid current backup, checksum failure, invalid archive paths, interrupted backup restart behavior, and attempted overwrite of an existing data directory.
