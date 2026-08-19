@@ -66,7 +66,7 @@ The script invokes rclone with `--config /etc/vaultwarden/rclone/rclone.conf` so
 6. If no configuration is available, run interactive `rclone config` to authorize Google Drive and configure the Crypt remote.
 7. Verify that the configured Crypt remote can list the backup prefix.
 8. Generate the Docker Compose configuration, Nginx site configuration, systemd backup service, and timer.
-9. Request the Let's Encrypt certificate, start Vaultwarden, and verify its `/alive` endpoint through HTTPS.
+9. Request the Let's Encrypt certificate, start Vaultwarden, and verify its `/alive` endpoint locally and through external HTTPS probe nodes.
 10. Enable the recurring backup timer.
 
 ## Mode 2: Restore From Google Drive
@@ -81,7 +81,7 @@ The script invokes rclone with `--config /etc/vaultwarden/rclone/rclone.conf` so
 8. Run SQLite `PRAGMA integrity_check` before installing the data.
 9. Refuse to overwrite populated data unless the operator explicitly confirms. Preserve existing data as a timestamped local rollback directory.
 10. Move the validated data into `/opt/vaultwarden/data`, apply restrictive permissions, and start the selected pinned Vaultwarden image.
-11. Verify the container status, logs, SQLite integrity, and HTTPS `/alive` endpoint.
+11. Verify the container status, logs, SQLite integrity, and local plus externally probed HTTPS `/alive` endpoints.
 12. Apply the requested `DOMAIN` configuration and warn that passkeys/WebAuthn registered for the old domain must be re-registered.
 
 ## Existing Backup Compatibility
@@ -126,7 +126,7 @@ The backup helper must:
 - Use a root-only staging path, never a world-readable temporary directory.
 - Include `--dry-run`, `--mode fresh|restore`, `--backup latest|NAME`, and `--resume` options.
 - Require interactive confirmation before destructive actions, including overwriting data and deleting expired backups.
-- Validate DNS and certificate issuance before declaring the deployment successful.
+- Validate DNS, certificate issuance, and external HTTPS reachability before declaring the deployment successful.
 
 ## Implementation Order
 

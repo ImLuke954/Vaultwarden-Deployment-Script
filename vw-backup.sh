@@ -67,6 +67,22 @@ compose() {
     fi
 }
 
+resolve_deployment_image() {
+    local compose_image container_image
+    [[ -r "$APP_DIR/.env" ]] || die "missing $APP_DIR/.env"
+    compose_image=$(awk -F= '$1 == "VAULTWARDEN_IMAGE" { print substr($0, index($0, "=") + 1); exit }' \
+        "$APP_DIR/.env")
+    [[ "$compose_image" =~ ^vaultwarden/server:[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || \
+        die 'active Compose image is invalid or not pinned'
+    VAULTWARDEN_IMAGE=$compose_image
+    container_image=$(docker inspect -f '{{.Config.Image}}' vaultwarden 2>/dev/null || true)
+    if [[ -n "$container_image" ]]; then
+        [[ "$container_image" =~ ^vaultwarden/server:[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || \
+            die 'configured Vaultwarden container image is invalid or not pinned'
+        VAULTWARDEN_IMAGE=$container_image
+    fi
+}
+
 remote_root_path() {
     if [[ -n "$BACKUP_PREFIX" ]]; then
         printf '%s:%s' "$RCLONE_REMOTE" "$BACKUP_PREFIX"
@@ -89,9 +105,13 @@ mkdir -p "$STAGE_ROOT" /run/lock
 chmod 0700 "$STAGE_ROOT"
 exec 9>"$LOCK_FILE"
 flock -n 9 || die 'another Vaultwarden operation is already running'
+resolve_deployment_image
 
 [[ -d "$DATA_DIR" ]] || die "missing Vaultwarden data directory: $DATA_DIR"
 [[ -f "$DATA_DIR/db.sqlite3" ]] || die 'db.sqlite3 is missing; refusing to create an incomplete backup'
+if find -P "$DATA_DIR" \( -type l -o -type f -links +1 \) -print -quit | grep -q .; then
+    die 'data directory contains symlinks or hardlinks, which are not supported by restore'
+fi
 
 RUN_STAGE=$(mktemp -d "$STAGE_ROOT/run.XXXXXX")
 RUNNING=0
@@ -149,7 +169,7 @@ log "verified $archive_name ($local_hash)"
 
 remote_listing="$RUN_STAGE/remote-list"
 rclone --config "$RCLONE_CONFIG" lsf --files-only --recursive "$(remote_root_path)" > "$remote_listing"
-mapfile -t archives < <(awk '/\.tar\.gz$/ { print }' "$remote_listing" | sort -r)
+mapfile -t archives < <(awk '$0 ~ /^vaultwarden-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z\.tar\.gz$/ { print }' "$remote_listing" | sort -r)
 if ((${#archives[@]} > BACKUP_RETENTION)); then
     for ((index=BACKUP_RETENTION; index<${#archives[@]}; index++)); do
         old=${archives[index]}

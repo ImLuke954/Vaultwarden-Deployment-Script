@@ -29,6 +29,7 @@ The target must be a real Ubuntu or Debian VPS with:
 - Root access or an account that can run the script with `sudo`
 - A public DNS record for the Vaultwarden domain pointing to the VPS
 - TCP ports 80 and 443 available for Nginx and Let's Encrypt validation
+- Outbound HTTPS access to `check-host.net` for the external HTTPS reachability check
 - At least 5 GiB of free root filesystem space recommended
 - A Google Drive rclone configuration containing the original Crypt remote, or permission to authenticate interactively
 
@@ -112,7 +113,8 @@ The older manual guide copied archives directly to the Crypt remote root. To res
 --backup-prefix .
 ```
 
-The script normalizes `.` to an empty root prefix.
+The script normalizes `.` to an empty root prefix and preserves that root
+prefix when `--resume` reloads prior settings.
 
 ## Fresh Installation
 
@@ -142,7 +144,7 @@ The fresh-install flow:
 5. Pulls the pinned Vaultwarden image.
 6. Creates the Compose and Vaultwarden environment files.
 7. Obtains or reuses a Let's Encrypt certificate.
-8. Starts Vaultwarden and tests both the local and public `/alive` endpoints.
+8. Starts Vaultwarden and tests the local, normal-DNS, and externally probed HTTPS `/alive` endpoints.
 9. Installs and enables the daily encrypted backup timer.
 
 ## Restore From Google Drive
@@ -155,8 +157,8 @@ Example for a new-format backup:
 sudo ./vw-deploy.sh \
   --mode restore \
   --domain new-vault.example.com \
-  --email admin@example.com \
-  --backup latest \
+   --email admin@example.com \
+   --backup latest \
   --rclone-remote gcrypt \
   --backup-prefix vaultwarden-backups \
   --retention 30
@@ -168,8 +170,8 @@ For an archive from the older guide, use the root prefix and explicitly provide 
 sudo ./vw-deploy.sh \
   --mode restore \
   --domain new-vault.example.com \
-  --email admin@example.com \
-  --backup latest \
+   --email admin@example.com \
+   --backup LEGACY_ARCHIVE.tar.gz \
   --image-tag 1.34.3 \
   --rclone-remote gcrypt \
   --backup-prefix .
@@ -179,6 +181,8 @@ The restore flow:
 
 1. Lists `.tar.gz` archives in the selected Crypt prefix.
 2. Lets the operator choose `latest`, a number, or an exact archive path.
+   `latest` selects only a canonical script-created `vaultwarden-TIMESTAMP.tar.gz`
+   archive; select legacy archives by number or exact name.
 3. Downloads only the selected archive and any checksum or manifest sidecars.
 4. Verifies the SHA-256 checksum when present.
 5. Validates new-format manifests and their image/checksum metadata.
@@ -188,7 +192,7 @@ The restore flow:
 9. Stops an existing Vaultwarden container only when data replacement is ready.
 10. Requires confirmation before replacing non-empty data.
 11. Preserves old data under `/opt/vaultwarden/data.pre-restore.TIMESTAMP`.
-12. Installs the validated data, starts the pinned image, and checks health over HTTPS.
+12. Installs the validated data, starts the pinned image, and checks local and externally probed HTTPS health.
 
 If the restore fails after old data has been moved but before the new deployment is committed, the script attempts to restore the previous data and restart the previous container. A failed restore copy is retained under a `data.failed-restore.TIMESTAMP` path for investigation.
 
@@ -252,7 +256,8 @@ The helper:
 5. Uploads all objects through the configured Crypt remote with `rclone copyto`.
 6. Downloads the uploaded archive back and compares its SHA-256 hash.
 7. Removes older archives only after the new upload is verified.
-8. Restarts Vaultwarden even when an earlier backup step fails.
+8. Refuses symlinks and hardlinks because the restore path does not accept them.
+9. Restarts Vaultwarden even when an earlier backup step fails.
 
 The helper deliberately does not use `rclone sync`. A local failure must not delete valid remote backups.
 
@@ -326,6 +331,8 @@ Do not update the image by changing it to `latest`. Use a deliberate, pinned upg
 ```bash
 sudo cp /opt/vaultwarden/compose.yml /opt/vaultwarden/compose.yml.before-upgrade
 sudo sed -i 's/vaultwarden\/server:[^ ]*/vaultwarden\/server:NEW_TAG/' /opt/vaultwarden/.env
+sudo sed -i 's|^VAULTWARDEN_IMAGE=.*$|VAULTWARDEN_IMAGE=vaultwarden/server:NEW_TAG|' \
+  /etc/vaultwarden/install.env
 sudo docker compose --project-directory /opt/vaultwarden \
   -f /opt/vaultwarden/compose.yml pull
 sudo docker compose --project-directory /opt/vaultwarden \
@@ -371,7 +378,7 @@ sudo nginx -t
 sudo journalctl -u nginx --no-pager -n 100
 ```
 
-Let's Encrypt must be able to reach the VPS on port 80. A pre-existing web server, incorrect DNS, or a cloud firewall can prevent validation.
+Let's Encrypt must be able to reach the VPS on port 80. The deployment also uses Check-Host nodes to verify external HTTPS access on port 443. A pre-existing web server, incorrect DNS, or a cloud firewall can prevent validation or the external health check.
 
 ### Backup service fails
 

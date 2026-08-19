@@ -16,6 +16,8 @@ STATE_FILE=/var/lib/vaultwarden/deploy.state
 COMPOSE_FILE=$APP_DIR/compose.yml
 NGINX_SITE=/etc/nginx/sites-available/vaultwarden.conf
 NGINX_LINK=/etc/nginx/sites-enabled/vaultwarden.conf
+CERTBOT_HOOK=/etc/letsencrypt/renewal-hooks/deploy/vaultwarden-nginx-reload
+PUBLIC_CHECK_API=https://check-host.net
 
 MODE=
 DOMAIN=
@@ -25,6 +27,7 @@ VAULTWARDEN_IMAGE=
 ADMIN_TOKEN_HASH=
 RCLONE_REMOTE=
 BACKUP_PREFIX=
+BACKUP_PREFIX_RESUMED=0
 BACKUP_RETENTION=30
 RETENTION_SET=0
 BACKUP_SELECTION=
@@ -35,7 +38,12 @@ STAGE_DIR=
 RESTORE_DATA_SOURCE=
 RESTORED_ARCHIVE=
 RESTORE_OLD_RUNNING=0
+RESTORE_OLD_PRESENT=0
+RESTORE_OLD_CONTAINER_ID=
+RESTORE_NEW_CONTAINER_ATTEMPTED=0
 RESTORE_ROLLBACK_DIR=
+RESTORE_CONFIG_ROLLBACK_DIR=
+RESTORE_NGINX_ROLLBACK_DIR=
 RESTORE_COMMITTED=0
 
 usage() {
@@ -86,19 +94,41 @@ on_error() {
 }
 
 cleanup() {
+    local current_container_id
     if [[ "$MODE" == restore && "$RESTORE_COMMITTED" == 0 ]]; then
-        if [[ -n "$RESTORE_ROLLBACK_DIR" && -e "$RESTORE_ROLLBACK_DIR" ]]; then
+        if [[ "$RESTORE_NEW_CONTAINER_ATTEMPTED" == 1 ]] && \
+           container_present vaultwarden; then
+            current_container_id=$(docker inspect -f '{{.Id}}' vaultwarden 2>/dev/null || true)
+            if [[ "$RESTORE_OLD_PRESENT" == 0 ]]; then
+                docker rm -f vaultwarden >/dev/null 2>&1 || true
+            elif [[ -n "$RESTORE_OLD_CONTAINER_ID" && \
+                    "$current_container_id" != "$RESTORE_OLD_CONTAINER_ID" ]]; then
+                docker rm -f vaultwarden >/dev/null 2>&1 || true
+            fi
+        fi
+        if [[ -n "$RESTORE_ROLLBACK_DIR" && ( -e "$RESTORE_ROLLBACK_DIR" || -L "$RESTORE_ROLLBACK_DIR" ) ]]; then
             if existing_container_running; then
                 docker stop vaultwarden >/dev/null 2>&1 || true
             fi
-            if [[ -e "$APP_DIR/data" ]]; then
+            if [[ -e "$APP_DIR/data" || -L "$APP_DIR/data" ]]; then
                 mv "$APP_DIR/data" "$APP_DIR/data.failed-restore.$(date -u +%Y%m%dT%H%M%SZ)" || true
             fi
             mv "$RESTORE_ROLLBACK_DIR" "$APP_DIR/data" || true
             log 'restore failed; previous Vaultwarden data was put back'
         fi
-        if [[ "$RESTORE_OLD_RUNNING" == 1 ]]; then
-            docker start vaultwarden >/dev/null 2>&1 || true
+        restore_previous_files || true
+        restore_previous_nginx || true
+        current_container_id=$(docker inspect -f '{{.Id}}' vaultwarden 2>/dev/null || true)
+        if [[ "$RESTORE_OLD_PRESENT" == 1 && -n "$current_container_id" && \
+              ( -z "$RESTORE_OLD_CONTAINER_ID" || \
+                "$current_container_id" == "$RESTORE_OLD_CONTAINER_ID" ) ]]; then
+            if [[ "$RESTORE_OLD_RUNNING" == 1 ]]; then
+                docker start "$current_container_id" >/dev/null 2>&1 || true
+            fi
+        elif [[ "$RESTORE_OLD_RUNNING" == 1 ]]; then
+            compose -f "$COMPOSE_FILE" up -d vaultwarden >/dev/null 2>&1 || true
+        elif [[ "$RESTORE_OLD_PRESENT" == 1 ]]; then
+            compose -f "$COMPOSE_FILE" create vaultwarden >/dev/null 2>&1 || true
         fi
     fi
     if [[ -n "$STAGE_DIR" && -d "$STAGE_DIR" ]]; then
@@ -276,6 +306,7 @@ load_resume_settings() {
     # shell metacharacters because all values are validated before writing.
     # shellcheck disable=SC1090
     source "$INSTALL_ENV"
+    BACKUP_PREFIX_RESUMED=1
     [[ -n "$cli_domain" ]] && DOMAIN=$cli_domain
     [[ -n "$cli_email" ]] && LETSENCRYPT_EMAIL=$cli_email
     [[ -n "$cli_tag" ]] && IMAGE_TAG=$cli_tag
@@ -306,7 +337,7 @@ collect_settings() {
     fi
     validate_remote_name "$RCLONE_REMOTE"
 
-    if [[ -z "$BACKUP_PREFIX" ]]; then
+    if [[ -z "$BACKUP_PREFIX" && "$BACKUP_PREFIX_RESUMED" == 0 ]]; then
         prompt_value BACKUP_PREFIX 'Backup path below the Crypt remote' 'vaultwarden-backups'
     fi
     [[ "$BACKUP_PREFIX" == . ]] && BACKUP_PREFIX=
@@ -485,6 +516,81 @@ write_compose() {
     compose -f "$COMPOSE_FILE" config -q
 }
 
+container_present() {
+    docker inspect "$1" >/dev/null 2>&1
+}
+
+snapshot_restore_path() {
+    local path=$1 name=$2
+    if [[ -e "$path" || -L "$path" ]]; then
+        cp -a -- "$path" "$RESTORE_CONFIG_ROLLBACK_DIR/$name"
+        printf 'present\n' > "$RESTORE_CONFIG_ROLLBACK_DIR/$name.state"
+    else
+        printf 'absent\n' > "$RESTORE_CONFIG_ROLLBACK_DIR/$name.state"
+    fi
+}
+
+restore_snapshot_path() {
+    local path=$1 name=$2 state
+    state=$RESTORE_CONFIG_ROLLBACK_DIR/$name.state
+    [[ -f "$state" ]] || return 0
+    rm -f -- "$path"
+    if [[ "$(<"$state")" == present ]]; then
+        cp -a -- "$RESTORE_CONFIG_ROLLBACK_DIR/$name" "$path"
+    fi
+}
+
+capture_restore_state() {
+    local old_container_id
+    [[ "$MODE" == restore ]] || return 0
+    RESTORE_CONFIG_ROLLBACK_DIR=$STAGE_DIR/previous-config
+    RESTORE_NGINX_ROLLBACK_DIR=$STAGE_DIR/previous-nginx
+    install -d -m 0700 "$RESTORE_CONFIG_ROLLBACK_DIR" "$RESTORE_NGINX_ROLLBACK_DIR"
+
+    snapshot_restore_path "$APP_DIR/.env" app-env
+    snapshot_restore_path "$COMPOSE_FILE" compose
+    snapshot_restore_path "$VAULTWARDEN_ENV" vaultwarden-env
+    snapshot_restore_path "$INSTALL_ENV" install-env
+    RESTORE_CONFIG_ROLLBACK_DIR=$RESTORE_NGINX_ROLLBACK_DIR
+    snapshot_restore_path "$NGINX_SITE" nginx-site
+    snapshot_restore_path "$NGINX_LINK" nginx-link
+    snapshot_restore_path /etc/nginx/sites-enabled/default nginx-default
+    snapshot_restore_path "$CERTBOT_HOOK" certbot-hook
+    RESTORE_CONFIG_ROLLBACK_DIR=$STAGE_DIR/previous-config
+
+    if container_present vaultwarden; then
+        RESTORE_OLD_PRESENT=1
+        old_container_id=$(docker inspect -f '{{.Id}}' vaultwarden 2>/dev/null || true)
+        RESTORE_OLD_CONTAINER_ID=$old_container_id
+        if existing_container_running; then
+            RESTORE_OLD_RUNNING=1
+        fi
+    fi
+}
+
+restore_previous_files() {
+    [[ -n "$RESTORE_CONFIG_ROLLBACK_DIR" && -d "$RESTORE_CONFIG_ROLLBACK_DIR" ]] || return 0
+    restore_snapshot_path "$APP_DIR/.env" app-env
+    restore_snapshot_path "$COMPOSE_FILE" compose
+    restore_snapshot_path "$VAULTWARDEN_ENV" vaultwarden-env
+    restore_snapshot_path "$INSTALL_ENV" install-env
+}
+
+restore_previous_nginx() {
+    [[ -n "$RESTORE_NGINX_ROLLBACK_DIR" && -d "$RESTORE_NGINX_ROLLBACK_DIR" ]] || return 0
+    RESTORE_CONFIG_ROLLBACK_DIR=$RESTORE_NGINX_ROLLBACK_DIR
+    restore_snapshot_path "$NGINX_SITE" nginx-site
+    restore_snapshot_path "$NGINX_LINK" nginx-link
+    restore_snapshot_path /etc/nginx/sites-enabled/default nginx-default
+    restore_snapshot_path "$CERTBOT_HOOK" certbot-hook
+    RESTORE_CONFIG_ROLLBACK_DIR=$STAGE_DIR/previous-config
+    if nginx -t >/dev/null 2>&1; then
+        systemctl reload nginx >/dev/null 2>&1 || true
+    else
+        warn "previous Nginx configuration could not be reloaded from $RESTORE_NGINX_ROLLBACK_DIR"
+    fi
+}
+
 write_nginx_bootstrap() {
     local temporary
     temporary=$(mktemp /etc/nginx/vaultwarden-bootstrap.XXXXXX)
@@ -514,8 +620,8 @@ NGINX
 }
 
 configure_tls() {
-    write_nginx_bootstrap
     getent hosts "$DOMAIN" >/dev/null || die "domain does not resolve: $DOMAIN"
+    write_nginx_bootstrap
     if [[ ! -s "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" || \
           ! -s "/etc/letsencrypt/live/$DOMAIN/privkey.pem" ]]; then
         log "requesting Let's Encrypt certificate for $DOMAIN"
@@ -529,12 +635,12 @@ configure_tls() {
     systemctl reload nginx
 
     install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
-    cat > /etc/letsencrypt/renewal-hooks/deploy/vaultwarden-nginx-reload <<'HOOK'
+    cat > "$CERTBOT_HOOK" <<'HOOK'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 systemctl reload nginx
 HOOK
-    chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/vaultwarden-nginx-reload
+    chmod 0755 "$CERTBOT_HOOK"
     systemctl enable --now certbot.timer >/dev/null 2>&1 || true
 }
 
@@ -582,15 +688,24 @@ list_remote_archives() {
     local listing=$STAGE_DIR/remote-list
     rclone --config "$RCLONE_CONFIG" lsf --files-only --recursive "$(remote_root_path)" > "$listing"
     mapfile -t REMOTE_ARCHIVES < <(awk '/\.tar\.gz$/ { print }' "$listing" | sort -r)
+    mapfile -t CANONICAL_REMOTE_ARCHIVES < <(
+        awk '$0 ~ /^vaultwarden-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z\.tar\.gz$/ { print }' \
+            "$listing" | sort -r
+    )
     ((${#REMOTE_ARCHIVES[@]} > 0)) || die 'no .tar.gz backups were found in the configured remote path'
 }
 
 choose_backup() {
-    local selected choice index
+    local selected choice index latest=
     list_remote_archives
+    if ((${#CANONICAL_REMOTE_ARCHIVES[@]} > 0)); then
+        latest=${CANONICAL_REMOTE_ARCHIVES[0]}
+    fi
     if [[ -n "$BACKUP_SELECTION" ]]; then
         if [[ "$BACKUP_SELECTION" == latest ]]; then
-            selected=${REMOTE_ARCHIVES[0]}
+            [[ -n "$latest" ]] || \
+                die 'no canonical Vaultwarden backups were found; select a legacy archive by exact name'
+            selected=$latest
         else
             selected=$BACKUP_SELECTION
             printf '%s\n' "${REMOTE_ARCHIVES[@]}" | grep -Fx "$selected" >/dev/null || \
@@ -601,16 +716,23 @@ choose_backup() {
     fi
 
     printf '\nAvailable backups (newest first):\n'
-    printf '  latest -> %s\n' "${REMOTE_ARCHIVES[0]}"
+    if [[ -n "$latest" ]]; then
+        printf '  latest -> %s\n' "$latest"
+    fi
     index=1
     for choice in "${REMOTE_ARCHIVES[@]}"; do
         printf '  %s. %s\n' "$index" "$choice"
         index=$((index + 1))
     done
-    read -r -p 'Choose latest, a number, or an exact archive name [latest]: ' choice
-    choice=${choice:-latest}
+    if [[ -n "$latest" ]]; then
+        read -r -p 'Choose latest, a number, or an exact archive name [latest]: ' choice
+        choice=${choice:-latest}
+    else
+        read -r -p 'Choose a number or an exact legacy archive name: ' choice
+    fi
     if [[ "$choice" == latest ]]; then
-        RESTORED_ARCHIVE=${REMOTE_ARCHIVES[0]}
+        [[ -n "$latest" ]] || die 'no canonical Vaultwarden backups were found'
+        RESTORED_ARCHIVE=$latest
     elif [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#REMOTE_ARCHIVES[@]})); then
         RESTORED_ARCHIVE=${REMOTE_ARCHIVES[choice - 1]}
     else
@@ -727,21 +849,18 @@ stop_existing_container() {
 
 install_restore_data() {
     local rollback data_dir=$APP_DIR/data
-    RESTORE_OLD_RUNNING=0
     RESTORE_ROLLBACK_DIR=
-    if existing_container_running; then
+    if [[ "$RESTORE_OLD_PRESENT" == 1 ]] && existing_container_running; then
         RESTORE_OLD_RUNNING=1
     fi
-    stop_existing_container
     if [[ -n "$(find "$data_dir" -mindepth 1 -print -quit)" ]]; then
-        confirm "Replace existing Vaultwarden data in $data_dir?" || die 'restore cancelled'
-        rollback=$APP_DIR/data.pre-restore.$(date -u +%Y%m%dT%H%M%SZ)
-        mv "$data_dir" "$rollback"
-        RESTORE_ROLLBACK_DIR=$rollback
-        log "existing data preserved at $rollback"
-    else
-        rm -rf -- "$data_dir"
+        confirm "Replace existing Vaultwarden data in $data_dir" || die 'restore cancelled'
     fi
+    stop_existing_container
+    rollback=$APP_DIR/data.pre-restore.$(date -u +%Y%m%dT%H%M%SZ)
+    mv "$data_dir" "$rollback"
+    RESTORE_ROLLBACK_DIR=$rollback
+    log "existing data preserved at $rollback"
     install -d -m 0700 "$data_dir"
     cp -a "$RESTORE_DATA_SOURCE"/. "$data_dir"/
 }
@@ -771,6 +890,9 @@ set_data_permissions() {
 
 start_and_verify() {
     compose -f "$COMPOSE_FILE" config -q
+    if [[ "$MODE" == restore ]]; then
+        RESTORE_NEW_CONTAINER_ATTEMPTED=1
+    fi
     compose -f "$COMPOSE_FILE" up -d
     local attempt
     for attempt in {1..30}; do
@@ -781,9 +903,47 @@ start_and_verify() {
         [[ "$attempt" -eq 30 ]] && die 'Vaultwarden did not become healthy; inspect docker logs vaultwarden'
         sleep 2
     done
-    curl -fsS --max-time 20 --resolve "$DOMAIN:443:127.0.0.1" \
+    curl --noproxy '*' -fsS --max-time 20 \
         "https://$DOMAIN/alive" >/dev/null
-    log "HTTPS health check passed for https://$DOMAIN/alive"
+    log "HTTPS health check passed through normal DNS for https://$DOMAIN/alive"
+    external_https_check
+}
+
+external_https_check() {
+    local response request_id result attempt
+    response=$(curl --noproxy '*' -fsS --max-time 20 \
+        -H 'Accept: application/json' \
+        --get \
+        --data-urlencode "host=https://$DOMAIN/alive" \
+        --data-urlencode 'max_nodes=3' \
+        "$PUBLIC_CHECK_API/check-http") || \
+        die 'could not start the external HTTPS reachability check'
+    request_id=$(jq -r '.request_id // empty' <<< "$response") || \
+        die 'external HTTPS reachability service returned invalid JSON'
+    [[ "$request_id" =~ ^[A-Za-z0-9_-]+$ ]] || \
+        die 'external HTTPS reachability service returned no request ID'
+
+    for attempt in {1..15}; do
+        result=$(curl --noproxy '*' -fsS --max-time 20 \
+            -H 'Accept: application/json' \
+            "$PUBLIC_CHECK_API/check-result/$request_id") || \
+            die 'could not read the external HTTPS reachability result'
+        if jq -e '
+            [ .[]? | .[]?
+              | select(
+                    type == "array"
+                    and (.[0] // 0) == 1
+                    and ((.[3] // "") | tostring | test("^2[0-9][0-9]$"))
+                )
+            ] | length > 0
+        ' <<< "$result" >/dev/null; then
+            log "external HTTPS health check passed for https://$DOMAIN/alive"
+            return 0
+        fi
+        [[ "$attempt" -eq 15 ]] || sleep 2
+    done
+
+    die "external HTTPS health check failed for https://$DOMAIN/alive"
 }
 
 install_backup_units() {
@@ -834,6 +994,7 @@ run_deployment() {
     log "pulling $VAULTWARDEN_IMAGE"
     docker pull "$VAULTWARDEN_IMAGE"
     generate_admin_hash
+    capture_restore_state
     write_compose_env
     write_deployment_env
     write_compose
@@ -845,9 +1006,9 @@ run_deployment() {
     set_data_permissions
     write_state vaultwarden-started
     start_and_verify
-    RESTORE_COMMITTED=1
     install_backup_units
     write_state complete
+    RESTORE_COMMITTED=1
     log 'Vaultwarden deployment completed successfully'
     if [[ "$MODE" == restore ]]; then
         warn "review Admin Panel -> General Settings and set the domain URL to https://$DOMAIN"
