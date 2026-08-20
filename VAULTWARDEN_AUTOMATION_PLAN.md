@@ -87,7 +87,7 @@ The script invokes rclone with `--config /etc/vaultwarden/rclone/rclone.conf` so
 ## Mode 2: Restore From Google Drive
 
 1. Complete the same server, Docker, Nginx, TLS, and rclone preparation as a fresh installation.
-2. List decrypted backups from the configured `gcrypt:` remote and let the operator select one. `latest` must be an explicit selectable option.
+2. List decrypted backups from the selected Crypt remote and let the operator select one. `latest` must be an explicit selectable option.
 3. Download only the selected archive, checksum, and manifest to `/var/lib/vaultwarden/restore/`.
 4. For the new archive format, verify the SHA-256 checksum and manifest before extraction.
 5. Inspect the archive paths before extraction and reject absolute paths, parent-directory traversal, and unexpected symbolic links.
@@ -127,7 +127,7 @@ The backup helper must:
 2. Stop Vaultwarden briefly before creating the archive, ensuring a consistent SQLite database and filesystem snapshot.
 3. Always restart Vaultwarden through a cleanup trap, including when the archive or upload fails.
 4. Create the archive and its SHA-256 checksum in a root-only staging directory.
-5. Upload through the encrypted `gcrypt:vaultwarden-backups/` remote using `rclone copy`.
+5. Upload through the encrypted selected-Crypt-remote `vaultwarden-backups/` path using `rclone copy`.
 6. Verify that the remote upload succeeded before deleting local staging files.
 7. Apply retention only after a successful verified backup.
 

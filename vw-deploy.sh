@@ -33,6 +33,7 @@ IMAGE_TAG=
 VAULTWARDEN_IMAGE=
 ADMIN_TOKEN_HASH=
 RCLONE_REMOTE=
+RCLONE_CRYPT_REMOTES=()
 BACKUP_PREFIX=
 BACKUP_PREFIX_RESUMED=0
 BACKUP_RETENTION=30
@@ -64,19 +65,21 @@ usage() {
     cat <<'USAGE'
 Usage: sudo ./vw-deploy.sh [options]
 
-Interactive mode presents the two supported operations. Options can be used
-for unattended values, but secrets are always read from standard input.
+Interactive mode presents the two supported operations and explains which
+values belong to the new server and which values come from the old server.
+Options can be used for unattended values, but secrets are always read from
+standard input.
 
 Options:
   --mode fresh|restore       Select the operation without the menu
   --domain DOMAIN            Public Vaultwarden DNS name
   --email ADDRESS            Let's Encrypt notification address
   --image-tag TAG            Pinned vaultwarden/server image tag
-  --rclone-remote NAME       rclone Crypt remote (default: gcrypt)
-  --backup-prefix PATH       Path below the Crypt remote
+  --rclone-remote NAME       rclone Crypt remote (auto-detected when possible)
+  --backup-prefix PATH       Path below the Crypt remote (default: detected)
   --retention COUNT          Number of remote archives to keep (default: 30)
   --backup NAME|latest       Archive to restore
-  --cloudflare-zone-id ID   Cloudflare zone for Fail2Ban bans
+  --cloudflare-zone-id ID    Cloudflare zone for Fail2Ban bans
   --resume                   Reuse existing deployment settings where possible
   --dry-run                  Print the selected operation and exit
   -h, --help                 Show this help
@@ -310,19 +313,179 @@ confirm() {
     [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]]
 }
 
+print_migration_help() {
+    if [[ "$MODE" == restore ]]; then
+        cat <<'EOF'
+
+This will configure a NEW VPS and restore your existing Vaultwarden data.
+
+Values marked [NEW VPS] are chosen for this new installation.
+Values marked [OLD SERVER] must come from the existing server or its backup.
+The old server will not be changed by this script, but do not run this
+restore on the old production server by mistake.
+
+Before continuing, make sure:
+  - The new domain's DNS record points to this VPS.
+  - You have the complete rclone.conf from the old server.
+  - You know the original rclone Crypt password and password2 if the config
+    must be recreated. They cannot be recovered from the backup files.
+  - Ports 80 and 443 are open to the internet.
+
+EOF
+    else
+        cat <<'EOF'
+
+This will configure a NEW, empty Vaultwarden installation on this VPS.
+
+All settings below are for the new server, except an existing rclone
+configuration if you choose to reuse an encrypted backup destination.
+Do not choose Restore unless you already have a Vaultwarden backup to use.
+
+Before continuing, make sure:
+  - The domain's DNS record points to this VPS.
+  - Ports 80 and 443 are open to the internet.
+
+EOF
+    fi
+}
+
+rclone_remote_type() {
+    local remote=$1
+    rclone --config "$RCLONE_CONFIG" config show "$remote" 2>/dev/null | \
+        awk -F= '$1 ~ /^[[:space:]]*type[[:space:]]*$/ { value = $2; gsub(/[[:space:]]/, "", value); print value; exit }'
+}
+
+find_crypt_remotes() {
+    local remotes remote
+    RCLONE_CRYPT_REMOTES=()
+    remotes=$(rclone --config "$RCLONE_CONFIG" listremotes 2>/dev/null) || \
+        die 'rclone could not read the configuration file'
+    while IFS= read -r remote; do
+        [[ -n "$remote" ]] || continue
+        remote=${remote%:}
+        [[ "$(rclone_remote_type "$remote")" == crypt ]] || continue
+        RCLONE_CRYPT_REMOTES+=("$remote")
+    done <<< "$remotes"
+}
+
+print_rclone_setup_help() {
+    if [[ "$MODE" == restore ]]; then
+        cat <<'EOF'
+
+
+The restore needs the complete rclone.conf from the old server. It must
+contain both the Google Drive remote and the Crypt remote. Do not paste only
+the [crypt] section: the underlying Google Drive remote is needed too.
+
+On the old server, run `rclone config file` to find the config path. Copy that
+complete file to this new VPS, then enter its local path when asked.
+
+For example, an old configuration may contain:
+
+  [gdrive]
+  type = drive
+  ...
+
+  [grive-crypt]
+  type = crypt
+  remote = gdrive:backup-chilika
+
+The value to select later is grive-crypt. The value gdrive:backup-chilika is
+the storage underneath it and is not the Crypt remote name.
+
+The Crypt password and password2 must be the original values. Creating a new
+Crypt remote with different passwords will not decrypt existing backups.
+
+EOF
+    else
+        cat <<'EOF'
+
+
+You may reuse an existing rclone.conf from another Vaultwarden server, or
+create a new Google Drive plus Crypt configuration. A Crypt remote encrypts
+file names and contents before they leave this server. This script refuses
+to use an unencrypted Google Drive remote.
+
+If you reuse an old configuration, copy the complete file. If you create a
+new Crypt remote, record its password and password2 somewhere safe because
+they are required to read future backups.
+
+EOF
+    fi
+}
+
+select_rclone_remote() {
+    local index choice
+    [[ -n "$RCLONE_REMOTE" ]] && return 0
+    find_crypt_remotes
+    case "${#RCLONE_CRYPT_REMOTES[@]}" in
+        0)
+            die 'no rclone Crypt remote was found; the config must contain a remote with type = crypt'
+            ;;
+        1)
+            RCLONE_REMOTE=${RCLONE_CRYPT_REMOTES[0]}
+            printf 'Detected the only encrypted rclone remote: %s\n' "$RCLONE_REMOTE"
+            ;;
+        *)
+            printf '\n[OLD SERVER] Choose the encrypted remote containing the Vaultwarden backups.\n'
+            index=1
+            for choice in "${RCLONE_CRYPT_REMOTES[@]}"; do
+                printf '  %s. %s\n' "$index" "$choice"
+                index=$((index + 1))
+            done
+            [[ -t 0 ]] || die 'multiple Crypt remotes were found; rerun with --rclone-remote NAME'
+            read -r -p 'Enter the number of the backup remote: ' choice
+            [[ "$choice" =~ ^[1-9][0-9]*$ ]] && \
+                ((choice <= ${#RCLONE_CRYPT_REMOTES[@]})) || \
+                die 'choose one of the listed Crypt remotes'
+            RCLONE_REMOTE=${RCLONE_CRYPT_REMOTES[choice - 1]}
+            ;;
+    esac
+}
+
+print_cloudflare_help() {
+    cat <<'EOF'
+
+
+Choose Cloudflare only when this domain uses the orange-cloud proxy in the
+Cloudflare DNS page. It lets Fail2Ban block abusive visitor IPs at Cloudflare.
+If the domain is DNS-only, the local firewall is the correct choice.
+
+To create the required API token:
+  1. Open https://dash.cloudflare.com/profile/api-tokens
+  2. Select Create Token, then Create Custom Token.
+  3. Name it something like vaultwarden-fail2ban.
+  4. Add exactly: Zone -> Firewall Services -> Edit.
+  5. Under Zone Resources, choose Include -> Specific zone and select this
+     domain. Do not grant access to all zones.
+  6. Create the token and copy it immediately; Cloudflare shows it once.
+
+Do not use the Global API Key. The token is entered without being displayed
+and is stored only in root-readable files on this VPS.
+
+The Zone ID is not the API token. Find it at the domain dashboard under
+Overview -> API -> Zone ID. It is a 32-character hexadecimal value.
+
+EOF
+}
+
 select_mode() {
-    [[ -n "$MODE" ]] && return
+    if [[ -n "$MODE" ]]; then
+        print_migration_help
+        return
+    fi
     [[ -t 0 ]] || die "--mode is required when standard input is not a terminal"
-    printf '\nVaultwarden deployment mode:\n'
-    printf '  1. Fresh installation\n'
-    printf '  2. Restore from encrypted Google Drive backup\n\n'
+    printf '\nWhat do you want to do?\n'
+    printf '  1. Install a new empty Vaultwarden server\n'
+    printf '  2. Install a new server and restore existing Vaultwarden data\n\n'
     local choice
-    read -r -p 'Choose 1 or 2: ' choice
+    read -r -p 'Choose 1 for new or 2 for restore: ' choice
     case "$choice" in
         1) MODE=fresh ;;
         2) MODE=restore ;;
-        *) die "choose 1 or 2" ;;
+        *) die 'choose 1 for a new server or 2 to restore existing data' ;;
     esac
+    print_migration_help
 }
 
 load_resume_settings() {
@@ -358,54 +521,82 @@ load_resume_settings() {
 collect_settings() {
     normalize_domain
     if [[ -z "$DOMAIN" ]]; then
-        prompt_value DOMAIN 'Public domain'
+        printf '\n[NEW VPS] Public domain\n'
+        printf 'Enter the hostname users will type to open Vaultwarden.\n'
+        printf 'Example: vault.example.com (do not include https://).\n'
+        printf 'Its DNS A/AAAA record must point to this VPS.\n'
+        prompt_value DOMAIN 'Vaultwarden domain'
         normalize_domain
     fi
     validate_domain "$DOMAIN"
 
     if [[ -z "$LETSENCRYPT_EMAIL" ]]; then
-        prompt_value LETSENCRYPT_EMAIL "Let's Encrypt email"
+        printf "\n[NEW VPS] Let's Encrypt email\n"
+        printf 'Use an email address you monitor for certificate expiration notices.\n'
+        prompt_value LETSENCRYPT_EMAIL 'Certificate notification email'
     fi
     validate_email "$LETSENCRYPT_EMAIL"
 
-    if [[ -z "$RCLONE_REMOTE" ]]; then
-        prompt_value RCLONE_REMOTE 'rclone Crypt remote' 'gcrypt'
-    fi
-    validate_remote_name "$RCLONE_REMOTE"
+    configure_rclone
 
     if [[ -z "$BACKUP_PREFIX" && "$BACKUP_PREFIX_RESUMED" == 0 ]]; then
-        prompt_value BACKUP_PREFIX 'Backup path below the Crypt remote' 'vaultwarden-backups'
+        local suggested_prefix
+        suggested_prefix=$(backup_prefix_suggestion)
+        printf '\n[BACKUP STORAGE] Backup folder inside %s:\n' "$RCLONE_REMOTE"
+        printf 'This is the folder containing the encrypted .tar.gz backup files.\n'
+        printf 'It is not the Google Drive path from the rclone config.\n'
+        printf 'Enter . only when the backup files are directly at the Crypt root.\n'
+        prompt_value BACKUP_PREFIX 'Backup folder' "$suggested_prefix"
     fi
     [[ "$BACKUP_PREFIX" == . ]] && BACKUP_PREFIX=
     BACKUP_PREFIX=${BACKUP_PREFIX#/}
     BACKUP_PREFIX=${BACKUP_PREFIX%/}
     validate_prefix "$BACKUP_PREFIX"
+    verify_rclone_backup_path
 
     if [[ "$RETENTION_SET" == 1 || ! -t 0 ]]; then
         :
     else
-        prompt_value BACKUP_RETENTION 'Remote backup retention count' "$BACKUP_RETENTION"
+        printf '\n[NEW BACKUP POLICY] Retention count\n'
+        printf 'The daily backup job keeps this many verified archives on the encrypted remote.\n'
+        printf 'The default of 30 keeps about one month of daily backups.\n'
+        prompt_value BACKUP_RETENTION 'Number of backups to keep' "$BACKUP_RETENTION"
     fi
     [[ "$BACKUP_RETENTION" =~ ^[1-9][0-9]*$ ]] || die "retention must be a positive integer"
 }
 
 collect_security_settings() {
-    local zone
+    local zone choice
     if [[ "$CLOUDFLARE_CONFIG_RESUMED" == 0 && -z "$CLOUDFLARE_ZONE_ID" && -t 0 ]]; then
-        read -r -p 'Cloudflare Zone ID (blank for local firewall bans): ' zone
-        CLOUDFLARE_ZONE_ID=$zone
+        print_cloudflare_help
+        printf 'Choose how Fail2Ban should block abusive visitor IPs:\n'
+        printf '  1. Local firewall (recommended for DNS-only domains)\n'
+        printf '  2. Cloudflare firewall (required when the domain is orange-cloud proxied)\n\n'
+        read -r -p 'Choose 1 or 2 [1]: ' choice
+        choice=${choice:-1}
+        case "$choice" in
+            1) CLOUDFLARE_ZONE_ID= ;;
+            2)
+                prompt_value zone 'Cloudflare Zone ID'
+                CLOUDFLARE_ZONE_ID=$zone
+                ;;
+            *) die 'choose 1 for the local firewall or 2 for Cloudflare' ;;
+        esac
     fi
     if [[ -z "$CLOUDFLARE_ZONE_ID" ]]; then
         [[ -z "$CLOUDFLARE_API_TOKEN" ]] || die 'Cloudflare API token requires a zone ID'
         return 0
     fi
-    [[ "$CLOUDFLARE_ZONE_ID" =~ ^[A-Fa-f0-9]{32}$ ]] || die 'Cloudflare Zone ID must be 32 hexadecimal characters'
+    [[ "$CLOUDFLARE_ZONE_ID" =~ ^[A-Fa-f0-9]{32}$ ]] || \
+        die 'Cloudflare Zone ID must be exactly 32 hexadecimal characters; find it on the domain Overview page'
     if [[ -z "$CLOUDFLARE_API_TOKEN" ]]; then
         [[ -t 0 ]] || die 'a Cloudflare API token is required when --cloudflare-zone-id is used'
+        printf '\n[NEW VPS] Cloudflare API token\n'
+        printf 'The token must have Zone -> Firewall Services -> Edit for this domain only.\n'
         prompt_secret CLOUDFLARE_API_TOKEN 'Cloudflare API token'
     fi
     [[ "$CLOUDFLARE_API_TOKEN" =~ ^[A-Za-z0-9._-]{20,256}$ ]] || \
-        die 'Cloudflare API token contains invalid characters or length'
+        die 'Cloudflare API token format is invalid; create a token, then paste the complete token value'
 }
 
 preflight() {
@@ -491,38 +682,79 @@ has_rclone_remote() {
 
 configure_rclone() {
     if [[ ! -s "$RCLONE_CONFIG" ]]; then
-        printf '\nNo rclone configuration was found.\n'
-        printf 'Place an existing config at:\n  %s\n' "$RCLONE_CONFIG"
-        printf 'Required permissions: directory 0700, file 0600.\n'
-        printf 'You may instead provide a local config path or configure Google Drive interactively.\n\n'
+        print_rclone_setup_help
+        printf 'No rclone configuration was found at:\n  %s\n\n' "$RCLONE_CONFIG"
+        printf 'You can provide a copy from this computer, or let rclone start its setup wizard.\n'
         local source_path
-        read -r -p 'Path to an existing rclone.conf (blank for interactive OAuth): ' source_path
+        read -r -p 'Local path to the complete rclone.conf (blank to create/configure one here): ' source_path
         if [[ -n "$source_path" ]]; then
             [[ -f "$source_path" ]] || die "rclone config not found: $source_path"
             install -m 0600 "$source_path" "$RCLONE_CONFIG"
         else
             [[ -t 0 ]] || die 'interactive rclone configuration requires a terminal'
+            cat <<'EOF'
+
+The rclone setup wizard will now open. For an existing restore:
+  - Reuse the old Google Drive remote and its authorization.
+  - Create or reuse a Crypt remote with the original password and password2.
+  - Do not make a new Crypt password for old backups.
+
+For a new backup destination:
+  - Create a Google Drive remote first.
+  - Create a Crypt remote pointing to that Google Drive remote.
+  - Write down both Crypt passwords somewhere safe.
+
+EOF
             rclone config --config "$RCLONE_CONFIG"
         fi
     fi
     chmod 0700 "$RCLONE_DIR"
     chmod 0600 "$RCLONE_CONFIG"
+    select_rclone_remote
+    validate_remote_name "$RCLONE_REMOTE"
     has_rclone_remote || {
         printf '\nThe configured rclone remotes are:\n'
         rclone --config "$RCLONE_CONFIG" listremotes
-        die "rclone remote '$RCLONE_REMOTE' was not found"
+        die "rclone remote '$RCLONE_REMOTE' was not found; check the name in brackets in rclone.conf"
     }
     local remote_type
-    remote_type=$(rclone --config "$RCLONE_CONFIG" config show "$RCLONE_REMOTE" 2>/dev/null | \
-        awk -F= '$1 ~ /^[[:space:]]*type[[:space:]]*$/ { value = $2; gsub(/[[:space:]]/, "", value); print value; exit }')
-    [[ "$remote_type" == crypt ]] || die "rclone remote '$RCLONE_REMOTE' is not a Crypt remote"
+    remote_type=$(rclone_remote_type "$RCLONE_REMOTE")
+    [[ "$remote_type" == crypt ]] || \
+        die "rclone remote '$RCLONE_REMOTE' is not encrypted; choose a remote whose type is crypt"
+    log "verified encrypted rclone remote $RCLONE_REMOTE"
+}
+
+backup_prefix_suggestion() {
+    local directories root_files suggestion=vaultwarden-backups
+    directories=$(rclone --config "$RCLONE_CONFIG" lsf --dirs-only --max-depth 1 \
+        "$RCLONE_REMOTE:" 2>/dev/null || true)
+    root_files=$(rclone --config "$RCLONE_CONFIG" lsf --files-only --max-depth 1 \
+        "$RCLONE_REMOTE:" 2>/dev/null || true)
+
+    if [[ "$directories" == *$'vaultwarden-backups/\n'* || "$directories" == 'vaultwarden-backups/' ]]; then
+        suggestion=vaultwarden-backups
+    elif grep -Eq '\.tar\.gz$' <<< "$root_files"; then
+        suggestion=.
+    fi
+
+    if [[ -n "$directories" ]]; then
+        printf '\nFound top-level folders in the encrypted remote:\n%s\n' "$directories" >&2
+    fi
+    if [[ -n "$root_files" ]]; then
+        printf 'Found top-level files in the encrypted remote:\n%s\n' "$root_files" >&2
+    fi
+    printf 'Suggested backup folder: %s\n' "$suggestion" >&2
+    printf '%s' "$suggestion"
+}
+
+verify_rclone_backup_path() {
     local remote_root
     remote_root=$(remote_root_path)
     if ! rclone --config "$RCLONE_CONFIG" lsf --max-depth 1 --files-only "$remote_root" >/dev/null 2>&1; then
         [[ "$MODE" == fresh ]] || die "cannot access backup path: $remote_root"
         rclone --config "$RCLONE_CONFIG" mkdir "$remote_root"
     fi
-    log "verified rclone remote $RCLONE_REMOTE"
+    log "verified encrypted backup path $remote_root"
 }
 
 remote_root_path() {
@@ -892,6 +1124,15 @@ existing_container_running() {
     [[ "$(docker inspect -f '{{.State.Running}}' vaultwarden 2>/dev/null || true)" == true ]]
 }
 
+prompt_pinned_image_tag() {
+    local context=$1
+    printf '\n%s\n' "$context"
+    printf 'Vaultwarden requires a specific version so an unexpected update cannot happen during setup.\n'
+    printf 'Use a release tag such as 1.34.3, not the word latest.\n'
+    printf 'Available releases: https://github.com/dani-garcia/vaultwarden/releases\n'
+    prompt_value IMAGE_TAG 'Vaultwarden image tag'
+}
+
 generate_admin_hash() {
     if [[ "$RESUME" == 1 && -s "$VAULTWARDEN_ENV" ]]; then
         local existing
@@ -905,9 +1146,11 @@ generate_admin_hash() {
 
     [[ -t 0 ]] || die 'an interactive terminal is required to create the admin token'
     local password confirmation output hash
-    read -r -s -p 'New Vaultwarden admin password: ' password
+    printf '\n[NEW VPS] Vaultwarden admin-panel password\n'
+    printf 'This is only for the /admin page. Existing users keep their current email addresses and master passwords.\n'
+    read -r -s -p 'New admin-panel password: ' password
     printf '\n'
-    read -r -s -p 'Repeat Vaultwarden admin password: ' confirmation
+    read -r -s -p 'Repeat new admin-panel password: ' confirmation
     printf '\n'
     [[ -n "$password" && "$password" == "$confirmation" ]] || die 'admin passwords do not match'
     output=$(printf '%s\n%s\n' "$password" "$confirmation" | \
@@ -959,7 +1202,10 @@ choose_backup() {
         return
     fi
 
-    printf '\nAvailable backups (newest first):\n'
+    printf '\n[OLD SERVER] Choose the Vaultwarden backup to restore.\n'
+    printf 'The default latest option is recommended because it selects the newest script-created backup.\n'
+    printf 'Older backups may be listed as legacy archives and require the old image version later.\n\n'
+    printf 'Available backups (newest first):\n'
     if [[ -n "$latest" ]]; then
         printf '  latest -> %s\n' "$latest"
     fi
@@ -969,10 +1215,10 @@ choose_backup() {
         index=$((index + 1))
     done
     if [[ -n "$latest" ]]; then
-        read -r -p 'Choose latest, a number, or an exact archive name [latest]: ' choice
+        read -r -p 'Enter latest, a number, or an exact archive name [latest]: ' choice
         choice=${choice:-latest}
     else
-        read -r -p 'Choose a number or an exact legacy archive name: ' choice
+        read -r -p 'Enter a number or an exact legacy archive name: ' choice
     fi
     if [[ "$choice" == latest ]]; then
         [[ -n "$latest" ]] || die 'no canonical Vaultwarden backups were found'
@@ -1043,7 +1289,20 @@ select_restore_image() {
         log "using Vaultwarden image from manifest: $VAULTWARDEN_IMAGE"
     elif [[ -z "$IMAGE_TAG" ]]; then
         warn 'legacy backup has no recorded Vaultwarden version'
-        prompt_value IMAGE_TAG 'Source Vaultwarden image tag (required for legacy restore)'
+        cat <<'EOF'
+
+[OLD SERVER] Vaultwarden version used to create this legacy backup
+
+This older backup does not record its Vaultwarden version. Restore it first
+with the same version that ran on the old server. On the old server, try:
+
+  docker inspect vaultwarden --format '{{.Config.Image}}'
+
+The result may look like vaultwarden/server:1.34.3. Enter only the part after
+the colon, for example 1.34.3. Do not enter latest.
+
+EOF
+        prompt_pinned_image_tag '[OLD SERVER] Source image version'
         set_image_from_tag "$IMAGE_TAG"
     else
         set_image_from_tag "$IMAGE_TAG"
@@ -1206,6 +1465,32 @@ install_backup_units() {
     systemctl enable --now vw-backup.timer
 }
 
+print_configuration_summary() {
+    printf '\n========================================\n'
+    printf 'Review the deployment settings\n'
+    printf '========================================\n'
+    printf 'Operation:             %s\n' "$([[ "$MODE" == restore ]] && printf 'restore existing data' || printf 'new empty installation')"
+    printf 'New VPS domain:        %s\n' "$DOMAIN"
+    printf 'Certificate email:     %s\n' "$LETSENCRYPT_EMAIL"
+    printf 'Vaultwarden image:     %s\n' "$VAULTWARDEN_IMAGE"
+    printf 'Encrypted rclone:      %s\n' "$RCLONE_REMOTE"
+    printf 'Backup path:           %s\n' "$(remote_root_path)"
+    printf 'Backups retained:      %s\n' "$BACKUP_RETENTION"
+    if [[ "$MODE" == restore ]]; then
+        printf 'Archive to restore:    %s\n' "$RESTORED_ARCHIVE"
+    fi
+    if [[ -n "$CLOUDFLARE_ZONE_ID" ]]; then
+        printf 'Fail2Ban bans:         Cloudflare firewall for zone %s\n' "$CLOUDFLARE_ZONE_ID"
+    else
+        printf 'Fail2Ban bans:         local firewall\n'
+    fi
+    printf '\nPasswords and API tokens are not shown above.\n'
+    printf 'The script will now install packages and configure this VPS.\n\n'
+    if [[ -t 0 ]]; then
+        confirm 'Are these settings correct; continue' || die 'deployment cancelled'
+    fi
+}
+
 write_state() {
     install -d -m 0700 /var/lib/vaultwarden
     printf '%s\n' "$1" > "$STATE_FILE"
@@ -1226,7 +1511,6 @@ run_deployment() {
     STAGE_DIR=$(mktemp -d "$RESTORE_ROOT/deploy.XXXXXX")
     collect_settings
     collect_security_settings
-    configure_rclone
 
     if [[ "$MODE" == restore ]]; then
         choose_backup
@@ -1235,12 +1519,13 @@ run_deployment() {
         validate_and_extract_restore
     else
         if [[ -z "$IMAGE_TAG" ]]; then
-            prompt_value IMAGE_TAG 'Pinned Vaultwarden image tag'
+            prompt_pinned_image_tag '[NEW VPS] Vaultwarden version'
         fi
         set_image_from_tag "$IMAGE_TAG"
         ensure_fresh_data_is_empty
     fi
 
+    print_configuration_summary
     write_state settings-collected
     log "pulling $VAULTWARDEN_IMAGE"
     docker pull "$VAULTWARDEN_IMAGE"

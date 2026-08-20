@@ -32,7 +32,7 @@ The target must be a real Ubuntu or Debian VPS with:
 - A public DNS record for the Vaultwarden domain pointing to the VPS
 - TCP ports 80 and 443 available for Nginx and Let's Encrypt validation
 - Outbound HTTPS access to `check-host.net` for the external HTTPS reachability check
-- If Cloudflare proxying is enabled, a Cloudflare Zone ID and API token with Zone Firewall Services edit permission
+- If Cloudflare proxying is enabled, a Cloudflare Zone ID and a custom API token with `Zone -> Firewall Services -> Edit` for only that zone
 - At least 5 GiB of free root filesystem space recommended
 - A Google Drive rclone configuration containing the original Crypt remote, or permission to authenticate interactively
 
@@ -52,13 +52,64 @@ sudo ./vw-deploy.sh
 The script presents this menu:
 
 ```text
-1. Fresh installation
-2. Restore from encrypted Google Drive backup
+1. Install a new empty Vaultwarden server
+2. Install a new server and restore existing Vaultwarden data
 ```
 
-The script asks for the public domain, Let's Encrypt email, pinned Vaultwarden image tag when needed, rclone Crypt remote, backup prefix, retention count, an optional Cloudflare Zone ID, and a new admin password. The Cloudflare API token is read without echo when a Zone ID is supplied.
+The interactive wizard labels each answer as belonging to the new VPS, the
+old server/backup, or an optional security feature. It also shows a final
+summary before making deployment changes.
 
 Before running the script, make sure the DNS record already resolves to this VPS. The script also checks DNS immediately before requesting the certificate.
+
+## Beginner Migration Guide
+
+Use **Restore** when you are moving an existing Vaultwarden installation to a
+new VPS. Use **Fresh installation** only when you want an empty Vaultwarden
+database.
+
+### Values from the old server
+
+For a restore, copy the complete old `rclone.conf`. It must include the
+Google Drive remote and the encrypted Crypt remote. In this example:
+
+Run `rclone config file` on the old server to find the file, then copy that
+complete file to the new VPS. Do not copy only the Crypt section.
+
+```ini
+[gdrive]
+type = drive
+...
+
+[grive-crypt]
+type = crypt
+remote = gdrive:backup-chilika
+```
+
+The remote name is `grive-crypt`. The `gdrive:backup-chilika` value is the
+underlying Google Drive location and must not be entered as the Crypt remote.
+The old Crypt `password` and `password2` must remain unchanged or existing
+backups cannot be decrypted.
+
+For a legacy backup without a manifest, find the old Vaultwarden image tag on
+the old server with:
+
+```bash
+docker inspect vaultwarden --format '{{.Config.Image}}'
+```
+
+If the result is `vaultwarden/server:1.34.3`, enter `1.34.3` when the wizard
+asks for the old image version. Never use `latest` for a restore.
+
+### Values for the new VPS
+
+Enter the new public domain, an email address you monitor for Let's Encrypt
+notices, a new Vaultwarden admin-panel password, and the number of backup
+archives to retain. Existing users keep their existing email addresses and
+master passwords after a restore.
+
+The new domain must have an `A` or `AAAA` DNS record pointing to the new VPS.
+Ports 80 and 443 must be reachable from the internet.
 
 ## rclone Configuration
 
@@ -78,7 +129,7 @@ sudo install -m 600 /path/to/rclone.conf \
   /etc/vaultwarden/rclone/rclone.conf
 ```
 
-The configuration should contain the same Crypt remote used by the original server. The default remote name expected by the script is `gcrypt`.
+The configuration should contain the same Crypt remote used by the original server. The wizard automatically detects a single Crypt remote. If multiple Crypt remotes exist, it displays their names and asks you to choose one.
 
 The script verifies both the remote name and its configured type:
 
@@ -90,19 +141,24 @@ It will not use a plain Google Drive remote for backups or restores.
 
 ### Interactive configuration
 
-If the file is absent, the script asks for a local configuration path. Leave that answer blank to start:
+If the file is absent, the script asks for a local configuration path. Enter
+the path to the complete file if you have copied it to the new VPS. Leave the
+answer blank to start:
 
 ```bash
 rclone config
 ```
 
-Complete Google Drive OAuth and configure the Crypt remote using the same Crypt password and salt as the original server. The Crypt password and salt cannot be recovered by this project if they are lost.
+Complete Google Drive OAuth and configure the Crypt remote. During a restore,
+use the same Crypt password and salt as the original server. The Crypt
+password and salt cannot be recovered by this project if they are lost.
 
 The rclone configuration contains Google credentials and encryption metadata. Keep it outside this repository and never paste it into logs or source control.
 
 ### Backup prefix
 
-The backup prefix is the path below the selected Crypt remote.
+The backup prefix is the path below the selected Crypt remote. The wizard
+lists top-level folders and files and suggests the correct value when it can.
 
 New backups use this default:
 
@@ -119,6 +175,26 @@ The older manual guide copied archives directly to the Crypt remote root. To res
 The script normalizes `.` to an empty root prefix and preserves that root
 prefix when `--resume` reloads prior settings.
 
+## Cloudflare API Token
+
+Cloudflare is optional. Choose the local firewall when the domain is DNS-only.
+Choose Cloudflare when the domain uses the orange-cloud proxy; local firewall
+bans cannot block visitors arriving through Cloudflare's edge network.
+
+Create a scoped custom token as follows:
+
+1. Open <https://dash.cloudflare.com/profile/api-tokens>.
+2. Select **Create Token**, then **Create Custom Token**.
+3. Name it `vaultwarden-fail2ban`.
+4. Add the permission `Zone -> Firewall Services -> Edit`.
+5. Under **Zone Resources**, choose **Include -> Specific zone** and select only this domain.
+6. Create the token and copy it immediately; Cloudflare displays it only once.
+
+Do not use the Global API Key. Find the 32-character Zone ID in the domain
+dashboard under **Overview -> API -> Zone ID**. The wizard asks for the Zone
+ID and then reads the API token without displaying it. It validates that the
+token can access the zone firewall rules before enabling Cloudflare bans.
+
 ## Fresh Installation
 
 Run the interactive command and select `1`, or use `--mode fresh`.
@@ -131,7 +207,7 @@ sudo ./vw-deploy.sh \
   --domain vault.example.com \
   --email admin@example.com \
   --image-tag 1.34.3 \
-  --rclone-remote gcrypt \
+  --rclone-remote grive-crypt \
   --backup-prefix vaultwarden-backups \
   --retention 30
 ```
@@ -163,7 +239,7 @@ sudo ./vw-deploy.sh \
   --domain new-vault.example.com \
    --email admin@example.com \
    --backup latest \
-  --rclone-remote gcrypt \
+   --rclone-remote grive-crypt \
   --backup-prefix vaultwarden-backups \
   --retention 30
 ```
@@ -177,7 +253,7 @@ sudo ./vw-deploy.sh \
    --email admin@example.com \
    --backup LEGACY_ARCHIVE.tar.gz \
   --image-tag 1.34.3 \
-  --rclone-remote gcrypt \
+   --rclone-remote grive-crypt \
   --backup-prefix .
 ```
 
@@ -227,7 +303,7 @@ Users keep their existing email addresses and master passwords. The master passw
 --domain DOMAIN            Public Vaultwarden DNS name
 --email ADDRESS            Let's Encrypt notification address
 --image-tag TAG            Pinned vaultwarden/server image tag
---rclone-remote NAME       rclone Crypt remote, default gcrypt
+--rclone-remote NAME       rclone Crypt remote, auto-detected when possible
 --backup-prefix PATH       Path below the Crypt remote
 --retention COUNT          Number of remote archives to retain, default 30
 --backup NAME|latest       Archive to restore
@@ -365,7 +441,7 @@ Check the Crypt remote, prefix, and remote contents:
 ```bash
 sudo rclone --config /etc/vaultwarden/rclone/rclone.conf listremotes
 sudo rclone --config /etc/vaultwarden/rclone/rclone.conf \
-  lsf --recursive gcrypt:vaultwarden-backups
+  lsf --recursive grive-crypt:vaultwarden-backups
 ```
 
 For archives from the old guide, use `--backup-prefix .`.
