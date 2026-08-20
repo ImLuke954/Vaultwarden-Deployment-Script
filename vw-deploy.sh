@@ -368,7 +368,7 @@ EOF
 rclone_remote_type() {
     local remote=$1
     rclone --config "$RCLONE_CONFIG" config show "$remote" 2>/dev/null | \
-        awk -F= '$1 ~ /^[[:space:]]*type[[:space:]]*$/ { value = $2; gsub(/[[:space:]]/, "", value); print value; exit }'
+        awk -F= '$1 ~ /^[[:space:]]*type[[:space:]]*$/ && !found { value = $2; gsub(/[[:space:]]/, "", value); print value; found = 1 }'
 }
 
 find_crypt_remotes() {
@@ -769,7 +769,7 @@ EOF
         die "rclone remote '$RCLONE_REMOTE' is not encrypted; choose a remote whose type is crypt"
     local remote_target remote_target_name
     remote_target=$(rclone --config "$RCLONE_CONFIG" config show "$RCLONE_REMOTE" 2>/dev/null | \
-        awk -F= '$1 ~ /^[[:space:]]*remote[[:space:]]*$/ { value = $2; sub(/^[[:space:]]*/, "", value); sub(/[[:space:]]*$/, "", value); print value; exit }')
+        awk -F= '$1 ~ /^[[:space:]]*remote[[:space:]]*$/ && !found { value = $2; sub(/^[[:space:]]*/, "", value); sub(/[[:space:]]*$/, "", value); print value; found = 1 }')
     [[ -n "$remote_target" ]] || die "rclone Crypt remote '$RCLONE_REMOTE' has no underlying remote"
     remote_target_name=${remote_target%%:*}
     [[ "$remote_target_name" != "$RCLONE_REMOTE" ]] || \
