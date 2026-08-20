@@ -324,6 +324,19 @@ sudo ./vw-deploy.sh --mode restore --backup latest --resume
 
 `--resume` reuses settings from `/etc/vaultwarden/install.env` where possible and allows an existing data directory or container to be continued. It does not bypass the restore confirmation prompt.
 
+For unattended Cloudflare setup, the token can be supplied through the
+environment. Do not put it in a command-line option because command-line
+arguments may be visible to other users on the VPS:
+
+```bash
+sudo CLOUDFLARE_API_TOKEN='your-token' ./vw-deploy.sh \
+  --mode fresh \
+  --cloudflare-zone-id YOUR_32_CHARACTER_ZONE_ID
+```
+
+The token is still validated and written only to the root-readable
+`/etc/vaultwarden/cloudflare.env` file.
+
 ## Backup Operation
 
 The installer enables `vw-backup.timer`. It runs daily around 03:00 UTC with a randomized delay of up to 15 minutes.

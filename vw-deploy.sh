@@ -58,7 +58,9 @@ RESTORE_FAIL2BAN_WAS_ENABLED=0
 RESTORE_FAIL2BAN_STATE_CAPTURED=0
 RESTORE_COMMITTED=0
 CLOUDFLARE_ZONE_ID=
-CLOUDFLARE_API_TOKEN=
+# Preserve a token supplied through the environment; the interactive prompt
+# remains the fallback for normal terminal use.
+CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN-}
 CLOUDFLARE_CONFIG_RESUMED=0
 
 usage() {
@@ -67,8 +69,13 @@ Usage: sudo ./vw-deploy.sh [options]
 
 Interactive mode presents the two supported operations and explains which
 values belong to the new server and which values come from the old server.
-Options can be used for unattended values, but secrets are always read from
-standard input.
+Options can be used for unattended values. Secrets are read from standard input
+unless supplied through their documented environment variables.
+
+For unattended Cloudflare setup, pass the token through the environment rather
+than putting it in a command-line option:
+
+  sudo CLOUDFLARE_API_TOKEN='token-value' ./vw-deploy.sh --cloudflare-zone-id ID
 
 Options:
   --mode fresh|restore       Select the operation without the menu
