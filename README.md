@@ -173,7 +173,9 @@ The older manual guide copied archives directly to the Crypt remote root. To res
 ```
 
 The script normalizes `.` to an empty root prefix and preserves that root
-prefix when `--resume` reloads prior settings.
+prefix when `--resume` reloads prior settings. Each installation also receives
+a stable backup instance ID, so backups sharing a remote path do not overwrite
+or expire one another.
 
 ## Cloudflare API Token
 
@@ -261,12 +263,13 @@ The restore flow:
 
 1. Lists `.tar.gz` archives in the selected Crypt prefix.
 2. Lets the operator choose `latest`, a number, or an exact archive path.
-   `latest` selects only a canonical script-created `vaultwarden-TIMESTAMP.tar.gz`
-   archive; select legacy archives by number or exact name.
+   `latest` selects only a canonical script-created `vaultwarden-INSTANCE_ID-TIMESTAMP.tar.gz`
+   archive when the backup instance is unambiguous; otherwise select an archive
+   by number or exact name.
 3. Downloads only the selected archive and any checksum or manifest sidecars.
 4. Verifies the SHA-256 checksum when present.
 5. Validates new-format manifests and their image/checksum metadata.
-6. Rejects absolute paths, parent-directory traversal, symlinks, and hardlinks.
+6. Rejects absolute paths, parent-directory traversal, links, and special filesystem entries.
 7. Extracts to a root-only staging directory.
 8. Locates exactly one `db.sqlite3` and runs SQLite `PRAGMA integrity_check`.
 9. Stops an existing Vaultwarden container only when data replacement is ready.
@@ -335,7 +338,8 @@ sudo CLOUDFLARE_API_TOKEN='your-token' ./vw-deploy.sh \
 ```
 
 The token is still validated and written only to the root-readable
-`/etc/vaultwarden/cloudflare.env` file.
+`/etc/vaultwarden/cloudflare.env` file. Supplying a token this way with
+`--resume` replaces the persisted token, which supports token rotation.
 
 ## Backup Operation
 
@@ -350,7 +354,7 @@ The helper:
 5. Uploads all objects through the configured Crypt remote with `rclone copyto`.
 6. Downloads the uploaded archive back and compares its SHA-256 hash.
 7. Removes older archives only after the new upload is verified.
-8. Refuses symlinks and hardlinks because the restore path does not accept them.
+8. Refuses links and special filesystem entries because the restore path does not accept them.
 9. Restarts Vaultwarden even when an earlier backup step fails.
 
 The helper deliberately does not use `rclone sync`. A local failure must not delete valid remote backups.
@@ -360,12 +364,15 @@ The helper deliberately does not use `rclone sync`. A local failure must not del
 New backups are stored as:
 
 ```text
-vaultwarden-TIMESTAMP.tar.gz
-vaultwarden-TIMESTAMP.tar.gz.sha256
-vaultwarden-TIMESTAMP.manifest.json
+vaultwarden-INSTANCE_ID-TIMESTAMP.tar.gz
+vaultwarden-INSTANCE_ID-TIMESTAMP.tar.gz.sha256
+vaultwarden-INSTANCE_ID-TIMESTAMP.manifest.json
 ```
 
-The manifest records the archive format version, UTC creation time, image reference, and SHA-256 value.
+`INSTANCE_ID` is a generated per-installation identifier. Retention deletes
+only archives with the current installation's ID. The manifest records the
+archive format version, UTC creation time, instance ID, image reference, and
+SHA-256 value.
 
 ### Inspect and run backups
 

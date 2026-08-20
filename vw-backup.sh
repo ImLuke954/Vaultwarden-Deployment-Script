@@ -43,7 +43,13 @@ source "$CONFIG"
 : "${RCLONE_REMOTE:?RCLONE_REMOTE is missing from install.env}"
 : "${BACKUP_PREFIX:=}"
 : "${BACKUP_RETENTION:?BACKUP_RETENTION is missing from install.env}"
+: "${BACKUP_INSTANCE_ID:=}"
 [[ "$BACKUP_RETENTION" =~ ^[1-9][0-9]*$ ]] || die 'BACKUP_RETENTION is invalid'
+if [[ -z "$BACKUP_INSTANCE_ID" ]]; then
+    [[ -r /etc/machine-id ]] || die 'BACKUP_INSTANCE_ID is missing and /etc/machine-id is unavailable'
+    BACKUP_INSTANCE_ID=$(sha256sum /etc/machine-id | awk '{print substr($1, 1, 32)}')
+fi
+[[ "$BACKUP_INSTANCE_ID" =~ ^[a-f0-9]{32}$ ]] || die 'BACKUP_INSTANCE_ID is invalid'
 
 RCLONE_CONFIG=/etc/vaultwarden/rclone/rclone.conf
 [[ -r "$RCLONE_CONFIG" ]] || die "missing $RCLONE_CONFIG"
@@ -109,8 +115,8 @@ resolve_deployment_image
 
 [[ -d "$DATA_DIR" ]] || die "missing Vaultwarden data directory: $DATA_DIR"
 [[ -f "$DATA_DIR/db.sqlite3" ]] || die 'db.sqlite3 is missing; refusing to create an incomplete backup'
-if find -P "$DATA_DIR" \( -type l -o -type f -links +1 \) -print -quit | grep -q .; then
-    die 'data directory contains symlinks or hardlinks, which are not supported by restore'
+if find -P "$DATA_DIR" \( -type l -o \( -type f -links +1 \) -o \( ! -type d -a ! -type f \) \) -print -quit | grep -q .; then
+    die 'data directory contains links or special filesystem entries, which are not supported by restore'
 fi
 
 RUN_STAGE=$(mktemp -d "$STAGE_ROOT/run.XXXXXX")
@@ -136,10 +142,10 @@ if [[ "$(docker inspect -f '{{.State.Running}}' vaultwarden 2>/dev/null || true)
 fi
 
 timestamp=$(date -u +%Y-%m-%dT%H%M%SZ)
-archive_name="vaultwarden-$timestamp.tar.gz"
+archive_name="vaultwarden-$BACKUP_INSTANCE_ID-$timestamp.tar.gz"
 archive="$RUN_STAGE/$archive_name"
 checksum="$RUN_STAGE/$archive_name.sha256"
-manifest="$RUN_STAGE/vaultwarden-$timestamp.manifest.json"
+manifest="$RUN_STAGE/${archive_name%.tar.gz}.manifest.json"
 
 tar -czf "$archive" -C "$(dirname "$DATA_DIR")" "$(basename "$DATA_DIR")"
 archive_hash=$(sha256sum "$archive" | awk '{print $1}')
@@ -149,12 +155,13 @@ jq -n \
     --arg timestamp "$timestamp" \
     --arg image "$VAULTWARDEN_IMAGE" \
     --arg sha256 "$archive_hash" \
-    '{archive_format: 1, archive: $archive, created_at: $timestamp, vaultwarden_image: $image, sha256: $sha256}' \
+    --arg backup_instance_id "$BACKUP_INSTANCE_ID" \
+    '{archive_format: 1, archive: $archive, created_at: $timestamp, vaultwarden_image: $image, sha256: $sha256, backup_instance_id: $backup_instance_id}' \
     > "$manifest"
 
 remote_archive=$(remote_object_path "$archive_name")
 remote_checksum=$(remote_object_path "$archive_name.sha256")
-remote_manifest=$(remote_object_path "vaultwarden-$timestamp.manifest.json")
+remote_manifest=$(remote_object_path "${archive_name%.tar.gz}.manifest.json")
 log "uploading encrypted backup to $RCLONE_REMOTE"
 rclone --config "$RCLONE_CONFIG" copyto "$archive" "$remote_archive"
 rclone --config "$RCLONE_CONFIG" copyto "$checksum" "$remote_checksum"
@@ -169,7 +176,12 @@ log "verified $archive_name ($local_hash)"
 
 remote_listing="$RUN_STAGE/remote-list"
 rclone --config "$RCLONE_CONFIG" lsf --files-only --recursive "$(remote_root_path)" > "$remote_listing"
-mapfile -t archives < <(awk '$0 ~ /^vaultwarden-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z\.tar\.gz$/ { print }' "$remote_listing" | sort -r)
+mapfile -t archives < <(
+    while IFS= read -r archive_candidate; do
+        [[ "$archive_candidate" =~ ^vaultwarden-${BACKUP_INSTANCE_ID}-[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{6}Z\.tar\.gz$ ]] || continue
+        printf '%s\n' "$archive_candidate"
+    done < "$remote_listing" | sort -r
+)
 if ((${#archives[@]} > BACKUP_RETENTION)); then
     for ((index=BACKUP_RETENTION; index<${#archives[@]}; index++)); do
         old=${archives[index]}

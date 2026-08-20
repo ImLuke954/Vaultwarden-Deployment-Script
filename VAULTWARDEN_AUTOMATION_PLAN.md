@@ -114,9 +114,9 @@ New backups must use a canonical timestamped format:
 
 ```text
 vaultwarden-backups/
-├── vaultwarden-2026-08-19T030000Z.tar.gz
-├── vaultwarden-2026-08-19T030000Z.tar.gz.sha256
-└── vaultwarden-2026-08-19T030000Z.manifest.json
+├── vaultwarden-INSTANCE_ID-2026-08-19T030000Z.tar.gz
+├── vaultwarden-INSTANCE_ID-2026-08-19T030000Z.tar.gz.sha256
+└── vaultwarden-INSTANCE_ID-2026-08-19T030000Z.manifest.json
 ```
 
 The manifest records the backup timestamp, archive format version, pinned Vaultwarden image tag, and verification metadata.

@@ -37,6 +37,7 @@ RCLONE_CRYPT_REMOTES=()
 BACKUP_PREFIX=
 BACKUP_PREFIX_RESUMED=0
 BACKUP_RETENTION=30
+BACKUP_INSTANCE_ID=
 RETENTION_SET=0
 BACKUP_SELECTION=
 DRY_RUN=0
@@ -274,6 +275,14 @@ validate_prefix() {
     [[ "$prefix" != *$'\n'* && "$prefix" != *$'\r'* ]] || die "invalid backup prefix"
 }
 
+ensure_backup_instance_id() {
+    if [[ -z "$BACKUP_INSTANCE_ID" ]]; then
+        [[ -r /proc/sys/kernel/random/uuid ]] || die 'cannot generate a backup instance ID'
+        BACKUP_INSTANCE_ID=$(tr -d '-' < /proc/sys/kernel/random/uuid)
+    fi
+    [[ "$BACKUP_INSTANCE_ID" =~ ^[a-f0-9]{32}$ ]] || die 'backup instance ID is invalid'
+}
+
 validate_image_tag() {
     local tag=$1
     [[ -n "$tag" ]] || die "a pinned Vaultwarden image tag is required"
@@ -500,7 +509,8 @@ load_resume_settings() {
 
     local cli_domain=$DOMAIN cli_email=$LETSENCRYPT_EMAIL cli_tag=$IMAGE_TAG
     local cli_remote=$RCLONE_REMOTE cli_prefix=$BACKUP_PREFIX cli_retention=$BACKUP_RETENTION
-    local cli_cloudflare_zone=$CLOUDFLARE_ZONE_ID cli_retention_set=$RETENTION_SET
+    local cli_cloudflare_zone=$CLOUDFLARE_ZONE_ID cli_cloudflare_token=$CLOUDFLARE_API_TOKEN
+    local cli_retention_set=$RETENTION_SET
     # This file is created by this script and is root-only. It contains no
     # shell metacharacters because all values are validated before writing.
     # shellcheck disable=SC1090
@@ -518,6 +528,7 @@ load_resume_settings() {
     [[ -n "$cli_remote" ]] && RCLONE_REMOTE=$cli_remote
     [[ -n "$cli_prefix" ]] && BACKUP_PREFIX=$cli_prefix
     [[ -n "$cli_cloudflare_zone" ]] && CLOUDFLARE_ZONE_ID=$cli_cloudflare_zone
+    [[ -n "$cli_cloudflare_token" ]] && CLOUDFLARE_API_TOKEN=$cli_cloudflare_token
     if [[ "$cli_retention_set" == 1 ]]; then
         BACKUP_RETENTION=$cli_retention
         RETENTION_SET=1
@@ -843,19 +854,25 @@ write_cloudflare_env() {
 ensure_vaultwarden_log() {
     local log_file=$APP_DIR/data/vaultwarden.log
     [[ ! -L "$log_file" ]] || die 'Vaultwarden log path must not be a symlink'
-    if [[ ! -e "$log_file" ]]; then
+    if [[ -e "$log_file" ]]; then
+        [[ -f "$log_file" ]] || die 'Vaultwarden log path must be a regular file'
+    else
         install -m 0600 /dev/null "$log_file"
     fi
 }
 
 validate_cloudflare_credentials() {
-    local response
+    local response curl_config
     [[ -n "$CLOUDFLARE_ZONE_ID" ]] || return 0
-    response=$(curl --noproxy '*' -fsS --max-time 20 \
-        -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-        -H 'Content-Type: application/json' \
-        "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/firewall/access_rules/rules?per_page=1") || \
+    curl_config=$(mktemp "$STAGE_DIR/cloudflare-curl.XXXXXX")
+    printf 'header = "Authorization: Bearer %s"\n' "$CLOUDFLARE_API_TOKEN" > "$curl_config"
+    printf 'header = "Content-Type: application/json"\n' >> "$curl_config"
+    response=$(curl --noproxy '*' -fsS --max-time 20 --config "$curl_config" \
+        "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/firewall/access_rules/rules?per_page=1") || {
+        rm -f -- "$curl_config"
         die 'could not validate the Cloudflare API token or zone ID'
+    }
+    rm -f -- "$curl_config"
     jq -e '.success == true' <<< "$response" >/dev/null || \
         die 'Cloudflare API token cannot access zone firewall rules'
 }
@@ -878,7 +895,6 @@ action = $action
 EOF
     if [[ -n "$CLOUDFLARE_ZONE_ID" ]]; then
         printf 'cfzone = %s\n' "$CLOUDFLARE_ZONE_ID" >> "$temporary"
-        printf 'cftoken = %s\n' "$CLOUDFLARE_API_TOKEN" >> "$temporary"
     fi
     cat >> "$temporary" <<'EOF'
 
@@ -949,6 +965,7 @@ write_deployment_env() {
         printf 'RCLONE_REMOTE=%q\n' "$RCLONE_REMOTE"
         printf 'BACKUP_PREFIX=%q\n' "$BACKUP_PREFIX"
         printf 'BACKUP_RETENTION=%q\n' "$BACKUP_RETENTION"
+        printf 'BACKUP_INSTANCE_ID=%q\n' "$BACKUP_INSTANCE_ID"
         printf 'APP_DIR=%q\n' "$APP_DIR"
         printf 'DATA_DIR=%q\n' "$APP_DIR/data"
         printf 'COMPOSE_FILE=%q\n' "$COMPOSE_FILE"
@@ -1181,11 +1198,34 @@ generate_admin_hash() {
 
     [[ -t 0 ]] || die 'an interactive terminal is required to create the admin token'
     local output hash
+    local -a script_args=(-q -e)
+    command -v script >/dev/null || die 'script is required to create the admin token'
+    # util-linux 2.34 lacks --echo; Vaultwarden still disables terminal echo itself.
+    if script --help 2>&1 | grep -F -- '--echo' >/dev/null; then
+        script_args+=(-E never)
+    fi
     printf '\n[NEW VPS] Vaultwarden admin-panel password\n'
     printf 'This is only for the /admin page. Existing users keep their current email addresses and master passwords.\n'
     printf 'Vaultwarden will ask for the password twice without echoing it.\n'
-    output=$(docker run --rm -it --entrypoint /vaultwarden "$VAULTWARDEN_IMAGE" hash)
-    hash=$(printf '%s\n' "$output" | awk '/^\$argon2(id|i|d)\$/ { sub(/\r$/, ""); print; exit }')
+    output=$(script "${script_args[@]}" -c \
+        "docker run --rm -it --entrypoint /vaultwarden $VAULTWARDEN_IMAGE hash" \
+        /dev/null | tee /dev/tty)
+    hash=$(printf '%s\n' "$output" | awk -F "'" '
+        {
+            value = $2
+            sub(/\r$/, "", value)
+            if ($1 == "ADMIN_TOKEN=" && value ~ /^\$argon2(id|i|d)\$/) {
+                print value
+                exit
+            }
+            value = $0
+            sub(/\r$/, "", value)
+            if (value ~ /^\$argon2(id|i|d)\$/) {
+                print value
+                exit
+            }
+        }
+    ')
     [[ "$hash" =~ ^\$argon2(id|i|d)\$ ]] || die 'Vaultwarden did not produce an Argon2 hash'
     ADMIN_TOKEN_HASH=$hash
 }
@@ -1203,24 +1243,54 @@ ensure_fresh_data_is_empty() {
 list_remote_archives() {
     local listing=$STAGE_DIR/remote-list
     rclone --config "$RCLONE_CONFIG" lsf --files-only --recursive "$(remote_root_path)" > "$listing"
-    mapfile -t REMOTE_ARCHIVES < <(awk '/\.tar\.gz$/ { print }' "$listing" | sort -r)
     mapfile -t CANONICAL_REMOTE_ARCHIVES < <(
-        awk '$0 ~ /^vaultwarden-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z\.tar\.gz$/ { print }' \
-            "$listing" | sort -r
+        while IFS= read -r archive; do
+            [[ "$archive" =~ ^vaultwarden-([a-f0-9]{32}-)?([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{6}Z)\.tar\.gz$ ]] || continue
+            printf '%s\t%s\n' "${BASH_REMATCH[2]}" "$archive"
+        done < "$listing" | sort -r | cut -f2-
+    )
+    mapfile -t REMOTE_ARCHIVES < <(
+        if ((${#CANONICAL_REMOTE_ARCHIVES[@]} > 0)); then
+            printf '%s\n' "${CANONICAL_REMOTE_ARCHIVES[@]}"
+        fi
+        while IFS= read -r archive; do
+            [[ "$archive" =~ ^vaultwarden-([a-f0-9]{32}-)?[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{6}Z\.tar\.gz$ ]] && continue
+            [[ "$archive" == *.tar.gz ]] || continue
+            printf '%s\n' "$archive"
+        done < "$listing" | sort -r
     )
     ((${#REMOTE_ARCHIVES[@]} > 0)) || die 'no .tar.gz backups were found in the configured remote path'
 }
 
 choose_backup() {
-    local selected choice index latest=
+    local selected choice index latest= archive
+    local -a backup_instances=()
     list_remote_archives
-    if ((${#CANONICAL_REMOTE_ARCHIVES[@]} > 0)); then
-        latest=${CANONICAL_REMOTE_ARCHIVES[0]}
+    if [[ -n "$BACKUP_INSTANCE_ID" ]]; then
+        for archive in "${CANONICAL_REMOTE_ARCHIVES[@]}"; do
+            if [[ "$archive" == "vaultwarden-$BACKUP_INSTANCE_ID-"* ]]; then
+                latest=$archive
+                break
+            fi
+        done
+    else
+        mapfile -t backup_instances < <(
+            for archive in "${CANONICAL_REMOTE_ARCHIVES[@]}"; do
+                if [[ "$archive" =~ ^vaultwarden-([a-f0-9]{32})- ]]; then
+                    printf '%s\n' "${BASH_REMATCH[1]}"
+                else
+                    printf 'legacy\n'
+                fi
+            done | sort -u
+        )
+        if ((${#backup_instances[@]} == 1)); then
+            latest=${CANONICAL_REMOTE_ARCHIVES[0]}
+        fi
     fi
     if [[ -n "$BACKUP_SELECTION" ]]; then
         if [[ "$BACKUP_SELECTION" == latest ]]; then
             [[ -n "$latest" ]] || \
-                die 'no canonical Vaultwarden backups were found; select a legacy archive by exact name'
+                die 'latest is unavailable because no unambiguous canonical backup instance was found; select an archive by number or exact name'
             selected=$latest
         else
             selected=$BACKUP_SELECTION
@@ -1232,9 +1302,9 @@ choose_backup() {
     fi
 
     printf '\n[OLD SERVER] Choose the Vaultwarden backup to restore.\n'
-    printf 'The default latest option is recommended because it selects the newest script-created backup.\n'
+    printf 'The default latest option is available only when the backup instance is unambiguous.\n'
     printf 'Older backups may be listed as legacy archives and require the old image version later.\n\n'
-    printf 'Available backups (newest first):\n'
+    printf 'Available backups (canonical backups newest first):\n'
     if [[ -n "$latest" ]]; then
         printf '  latest -> %s\n' "$latest"
     fi
@@ -1247,10 +1317,10 @@ choose_backup() {
         read -r -p 'Enter latest, a number, or an exact archive name [latest]: ' choice
         choice=${choice:-latest}
     else
-        read -r -p 'Enter a number or an exact legacy archive name: ' choice
+        read -r -p 'Enter a number or an exact archive name: ' choice
     fi
     if [[ "$choice" == latest ]]; then
-        [[ -n "$latest" ]] || die 'no canonical Vaultwarden backups were found'
+        [[ -n "$latest" ]] || die 'latest is unavailable because no unambiguous canonical backup instance was found'
         RESTORED_ARCHIVE=$latest
     elif [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#REMOTE_ARCHIVES[@]})); then
         RESTORED_ARCHIVE=${REMOTE_ARCHIVES[choice - 1]}
@@ -1348,8 +1418,8 @@ validate_archive_paths() {
         [[ "/$path/" != */../* ]] || die 'archive contains parent-directory traversal'
     done < "$names"
     tar -tvzf "$archive" > "$details"
-    awk 'substr($0, 1, 1) ~ /^[lh]$/ { found = 1 } END { exit found }' "$details" && return 0
-    die 'archive contains symlinks or hardlinks, which are not accepted'
+    awk 'substr($0, 1, 1) !~ /^[-d]$/ { found = 1 } END { exit found }' "$details" && return 0
+    die 'archive contains links or special filesystem entries, which are not accepted'
 }
 
 validate_and_extract_restore() {
@@ -1554,6 +1624,7 @@ run_deployment() {
         ensure_fresh_data_is_empty
     fi
 
+    ensure_backup_instance_id
     print_configuration_summary
     write_state settings-collected
     log "pulling $VAULTWARDEN_IMAGE"
