@@ -632,16 +632,44 @@ preflight() {
 }
 
 install_packages() {
-    log 'installing required packages'
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y ca-certificates curl docker.io nginx certbot fail2ban logrotate \
+    local required_packages=(
+        ca-certificates curl docker.io nginx certbot fail2ban logrotate
         python3-certbot-nginx python3-pyinotify rclone sqlite3 jq tar gzip coreutils util-linux
+    )
+    local missing_packages=()
+    local package
+    local apt_updated=0
 
-    systemctl enable --now docker
-    systemctl enable --now nginx
+    for package in "${required_packages[@]}"; do
+        if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -qx 'install ok installed'; then
+            missing_packages+=("$package")
+        fi
+    done
+
+    export DEBIAN_FRONTEND=noninteractive
+    if ((${#missing_packages[@]} > 0)); then
+        log 'installing missing packages'
+        apt-get update
+        apt_updated=1
+        apt-get install -y "${missing_packages[@]}"
+    else
+        log 'required packages are already installed'
+    fi
+
+    if ! systemctl is-enabled --quiet docker 2>/dev/null ||
+        ! systemctl is-active --quiet docker 2>/dev/null; then
+        systemctl enable --now docker
+    fi
+    if ! systemctl is-enabled --quiet nginx 2>/dev/null ||
+        ! systemctl is-active --quiet nginx 2>/dev/null; then
+        systemctl enable --now nginx
+    fi
 
     if ! docker compose version >/dev/null 2>&1; then
+        if ((apt_updated == 0)); then
+            apt-get update
+            apt_updated=1
+        fi
         if ! apt-get install -y docker-compose-plugin; then
             if ! apt-get install -y docker-compose-v2; then
                 apt-get install -y docker-compose
