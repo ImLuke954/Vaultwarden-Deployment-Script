@@ -142,7 +142,7 @@ The backup helper must:
 - Use a root-only staging path, never a world-readable temporary directory.
 - Include `--dry-run`, `--mode fresh|restore`, `--backup latest|NAME`, and `--resume` options.
 - Require interactive confirmation before destructive actions, including overwriting data and deleting expired backups.
-- Validate DNS, certificate issuance, and external HTTPS reachability before declaring the deployment successful.
+- Validate DNS and certificate issuance before declaring success; treat external HTTPS probes as best-effort because geo-blocking and access policies can reject probe nodes.
 - Trust `CF-Connecting-IP` only from Cloudflare's published IP ranges and forward it to Vaultwarden through `X-Real-IP`.
 - Configure Vaultwarden authentication, admin-token, and TOTP Fail2Ban jails from the root-only log file.
 - Use a Cloudflare API token action for bans when the domain is proxied through Cloudflare.

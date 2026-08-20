@@ -31,7 +31,7 @@ The target must be a real Ubuntu or Debian VPS with:
 - Root access or an account that can run the script with `sudo`
 - A public DNS record for the Vaultwarden domain pointing to the VPS
 - TCP ports 80 and 443 available for Nginx and Let's Encrypt validation
-- Outbound HTTPS access to `check-host.net` for the external HTTPS reachability check
+- Outbound HTTPS access to `check-host.net` if external HTTPS probing is desired
 - If Cloudflare proxying is enabled, a Cloudflare Zone ID and a custom API token with `Zone -> Firewall Services -> Edit` for only that zone
 - At least 5 GiB of free root filesystem space recommended
 - A Google Drive rclone configuration containing the original Crypt remote, or permission to authenticate interactively
@@ -514,7 +514,30 @@ sudo nginx -t
 sudo journalctl -u nginx --no-pager -n 100
 ```
 
-Let's Encrypt must be able to reach the VPS on port 80. The deployment also uses Check-Host nodes to verify external HTTPS access on port 443. A pre-existing web server, incorrect DNS, or a cloud firewall can prevent validation or the external health check.
+Let's Encrypt must be able to reach the VPS on port 80. The deployment also
+attempts to use Check-Host nodes to verify external HTTPS access on port 443.
+That probe is best-effort because geo-blocking, an allowlist, or a temporary
+probe-service failure can prevent those nodes from reaching an otherwise
+working installation. Local and normal-DNS HTTPS checks remain required.
+
+HTTP 526 during the public HTTPS check is returned by Cloudflare when it cannot
+validate the certificate presented by the origin. Check that the domain's A and
+AAAA records point to this VPS, the Cloudflare SSL mode is **Full (strict)**,
+and the certificate served by Nginx covers the requested domain and has not
+expired:
+
+```bash
+sudo openssl x509 -in /etc/letsencrypt/live/vault.example.com/fullchain.pem \
+  -noout -subject -issuer -dates -ext subjectAltName
+sudo curl --noproxy '*' -k --resolve vault.example.com:443:127.0.0.1 \
+  https://vault.example.com/alive
+sudo curl --noproxy '*' -I https://vault.example.com/alive
+```
+
+The `--resolve` curl command checks Nginx on the VPS while the `openssl`
+command checks the certificate. The final curl checks the public DNS and
+Cloudflare path. A local success with public 526 usually means Cloudflare is
+pointed at a different origin or has a stale AAAA record.
 
 ### Backup service fails
 

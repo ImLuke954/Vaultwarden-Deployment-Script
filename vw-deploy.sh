@@ -651,7 +651,7 @@ preflight() {
 
 install_packages() {
     local required_packages=(
-        ca-certificates curl docker.io nginx certbot fail2ban logrotate
+        ca-certificates curl openssl docker.io nginx certbot fail2ban logrotate
         python3-certbot-nginx python3-pyinotify rclone sqlite3 jq tar gzip coreutils util-linux
     )
     local missing_packages=()
@@ -1155,14 +1155,23 @@ NGINX
 }
 
 configure_tls() {
+    local certificate="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+    local private_key="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+    local certbot_args
     getent hosts "$DOMAIN" >/dev/null || die "domain does not resolve: $DOMAIN"
     write_nginx_bootstrap
-    if [[ ! -s "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" || \
-          ! -s "/etc/letsencrypt/live/$DOMAIN/privkey.pem" ]]; then
+    certbot_args=(certonly --webroot -w /var/www/certbot -d "$DOMAIN"
+        --email "$LETSENCRYPT_EMAIL" --agree-tos --no-eff-email --non-interactive)
+    if [[ ! -s "$certificate" || ! -s "$private_key" ]]; then
         log "requesting Let's Encrypt certificate for $DOMAIN"
-        certbot certonly --webroot -w /var/www/certbot -d "$DOMAIN" \
-            --email "$LETSENCRYPT_EMAIL" --agree-tos --no-eff-email --non-interactive
+        certbot "${certbot_args[@]}"
+    elif ! openssl x509 -in "$certificate" -noout -checkend 0 \
+            -checkhost "$DOMAIN" >/dev/null 2>&1; then
+        log "existing certificate for $DOMAIN is expired or does not match; requesting a replacement"
+        certbot "${certbot_args[@]}" --force-renewal
     fi
+    openssl x509 -in "$certificate" -noout -checkend 0 -checkhost "$DOMAIN" >/dev/null 2>&1 || \
+        die "the TLS certificate for $DOMAIN is expired or does not match the domain"
     [[ -f "$SCRIPT_DIR/templates/nginx.conf" ]] || die 'templates/nginx.conf is missing'
     sed "s/__DOMAIN__/$DOMAIN/g" "$SCRIPT_DIR/templates/nginx.conf" > "$NGINX_SITE"
     chmod 0644 "$NGINX_SITE"
@@ -1498,6 +1507,7 @@ set_data_permissions() {
 }
 
 start_and_verify() {
+    local public_status
     compose -f "$COMPOSE_FILE" config -q
     if [[ "$MODE" == restore ]]; then
         RESTORE_NEW_CONTAINER_ATTEMPTED=1
@@ -1518,8 +1528,21 @@ start_and_verify() {
         [[ "$attempt" -eq 45 ]] && die 'Vaultwarden did not become healthy; inspect docker logs vaultwarden'
         sleep 2
     done
-    curl --noproxy '*' -fsS --max-time 20 \
-        "https://$DOMAIN/alive" >/dev/null
+    curl --noproxy '*' -kfsS --max-time 20 \
+        --resolve "$DOMAIN:443:127.0.0.1" \
+        "https://$DOMAIN/alive" >/dev/null || \
+        die "local Nginx HTTPS health check failed for https://$DOMAIN/alive"
+    log "local Nginx HTTPS health check passed for https://$DOMAIN/alive"
+    if ! public_status=$(curl --noproxy '*' -sS --max-time 20 \
+            -o /dev/null -w '%{http_code}' "https://$DOMAIN/alive"); then
+        die "could not complete the public HTTPS health check for https://$DOMAIN/alive"
+    fi
+    [[ "$public_status" =~ ^2[0-9][0-9]$ ]] || {
+        if [[ "$public_status" == 526 ]]; then
+            die "public HTTPS health check returned HTTP 526; Cloudflare rejected the origin certificate or is reaching the wrong origin"
+        fi
+        die "public HTTPS health check returned HTTP $public_status for https://$DOMAIN/alive"
+    }
     log "HTTPS health check passed through normal DNS for https://$DOMAIN/alive"
     external_https_check
 }
@@ -1532,17 +1555,19 @@ external_https_check() {
         --data-urlencode "host=https://$DOMAIN/alive" \
         --data-urlencode 'max_nodes=3' \
         "$PUBLIC_CHECK_API/check-http") || \
-        die 'could not start the external HTTPS reachability check'
+        { warn 'could not start the external HTTPS reachability check; local and normal-DNS checks passed, so continuing'; return 0; }
     request_id=$(jq -r '.request_id // empty' <<< "$response") || \
-        die 'external HTTPS reachability service returned invalid JSON'
-    [[ "$request_id" =~ ^[A-Za-z0-9_-]+$ ]] || \
-        die 'external HTTPS reachability service returned no request ID'
+        { warn 'external HTTPS reachability service returned invalid JSON; local and normal-DNS checks passed, so continuing'; return 0; }
+    [[ "$request_id" =~ ^[A-Za-z0-9_-]+$ ]] || {
+        warn 'external HTTPS reachability service returned no request ID; local and normal-DNS checks passed, so continuing'
+        return 0
+    }
 
     for attempt in {1..15}; do
         result=$(curl --noproxy '*' -fsS --max-time 20 \
             -H 'Accept: application/json' \
             "$PUBLIC_CHECK_API/check-result/$request_id") || \
-            die 'could not read the external HTTPS reachability result'
+            { warn 'could not read the external HTTPS reachability result; local and normal-DNS checks passed, so continuing'; return 0; }
         if jq -e '
             [ .[]? | .[]?
               | select(
@@ -1558,7 +1583,8 @@ external_https_check() {
         [[ "$attempt" -eq 15 ]] || sleep 2
     done
 
-    die "external HTTPS health check failed for https://$DOMAIN/alive"
+    warn "external HTTPS health check failed for https://$DOMAIN/alive; local and normal-DNS checks passed, so continuing"
+    return 0
 }
 
 install_backup_units() {
