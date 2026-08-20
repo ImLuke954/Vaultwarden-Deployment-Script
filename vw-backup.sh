@@ -56,6 +56,12 @@ RCLONE_CONFIG=/etc/vaultwarden/rclone/rclone.conf
 remote_type=$(rclone --config "$RCLONE_CONFIG" config show "$RCLONE_REMOTE" 2>/dev/null | \
     awk -F= '$1 ~ /^[[:space:]]*type[[:space:]]*$/ { value = $2; gsub(/[[:space:]]/, "", value); print value; exit }')
 [[ "$remote_type" == crypt ]] || die "rclone remote '$RCLONE_REMOTE' is not a Crypt remote"
+remote_target=$(rclone --config "$RCLONE_CONFIG" config show "$RCLONE_REMOTE" 2>/dev/null | \
+    awk -F= '$1 ~ /^[[:space:]]*remote[[:space:]]*$/ { value = $2; sub(/^[[:space:]]*/, "", value); sub(/[[:space:]]*$/, "", value); print value; exit }')
+[[ -n "$remote_target" ]] || die "rclone Crypt remote '$RCLONE_REMOTE' has no underlying remote"
+remote_target_name=${remote_target%%:*}
+[[ "$remote_target_name" != "$RCLONE_REMOTE" ]] || \
+    die "rclone Crypt remote '$RCLONE_REMOTE' points to itself; set its remote = value to a different storage remote"
 
 if docker compose version >/dev/null 2>&1; then
     COMPOSE_KIND=plugin

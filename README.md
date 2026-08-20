@@ -139,6 +139,11 @@ type = crypt
 
 It will not use a plain Google Drive remote for backups or restores.
 
+The Crypt remote must point to a different underlying storage remote. For
+example, `[new-gdrive-crypt]` should contain `remote = new-gdrive:backups`,
+not `remote = new-gdrive-crypt:`. A Crypt remote pointing to itself cannot be
+opened by rclone and will be rejected before Vaultwarden is stopped.
+
 ### Interactive configuration
 
 If the file is absent, the script asks for a local configuration path. Enter

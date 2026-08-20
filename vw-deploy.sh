@@ -767,6 +767,13 @@ EOF
     remote_type=$(rclone_remote_type "$RCLONE_REMOTE")
     [[ "$remote_type" == crypt ]] || \
         die "rclone remote '$RCLONE_REMOTE' is not encrypted; choose a remote whose type is crypt"
+    local remote_target remote_target_name
+    remote_target=$(rclone --config "$RCLONE_CONFIG" config show "$RCLONE_REMOTE" 2>/dev/null | \
+        awk -F= '$1 ~ /^[[:space:]]*remote[[:space:]]*$/ { value = $2; sub(/^[[:space:]]*/, "", value); sub(/[[:space:]]*$/, "", value); print value; exit }')
+    [[ -n "$remote_target" ]] || die "rclone Crypt remote '$RCLONE_REMOTE' has no underlying remote"
+    remote_target_name=${remote_target%%:*}
+    [[ "$remote_target_name" != "$RCLONE_REMOTE" ]] || \
+        die "rclone Crypt remote '$RCLONE_REMOTE' points to itself; set its remote = value to a different storage remote"
     log "verified encrypted rclone remote $RCLONE_REMOTE"
 }
 
