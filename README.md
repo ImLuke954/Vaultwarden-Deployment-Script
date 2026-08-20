@@ -16,6 +16,7 @@ The deployment is intentionally conservative:
 
 - `vw-deploy.sh`: interactive fresh-install and restore provisioner
 - `vw-backup.sh`: encrypted backup helper installed as `/usr/local/sbin/vw-backup.sh`
+- `vw-uninstall.sh`: conservative removal helper for a deployed server
 - `templates/compose.yml`: Docker Compose service definition
 - `templates/nginx.conf`: Cloudflare-aware Nginx HTTP to HTTPS redirect and reverse proxy
 - `templates/fail2ban/`: Vaultwarden filters and Cloudflare API action
@@ -551,12 +552,19 @@ Confirm that Docker is running, the rclone remote is still type `crypt`, the Cry
 
 ## Removal
 
-There is no automatic uninstall command because deleting Vaultwarden data or backups is destructive. To remove the running service while preserving data, stop and disable the containers and timer manually:
+Use the uninstall helper to remove the running service and configuration while preserving local data, rclone credentials, remote backups, Let's Encrypt certificates, and installed packages:
 
 ```bash
-sudo systemctl disable --now vw-backup.timer
-sudo docker compose --project-directory /opt/vaultwarden \
-  -f /opt/vaultwarden/compose.yml down
+sudo chmod 700 vw-uninstall.sh
+sudo ./vw-uninstall.sh
 ```
 
-Review and remove `/opt/vaultwarden`, `/etc/vaultwarden`, the Nginx site, and systemd units only after exporting any required data and confirming that backups are readable.
+The script removes the Vaultwarden container, backup units, Nginx site, Fail2Ban files, logrotate policy, Certbot renewal hook, and deployment configuration. It leaves `/opt/vaultwarden/data` and `/etc/vaultwarden/rclone/` intact so the server can be restored later.
+
+To also permanently remove all local Vaultwarden data, restore rollback copies, and rclone credentials, use the separately confirmed purge mode:
+
+```bash
+sudo ./vw-uninstall.sh --purge-data
+```
+
+`--purge-data` never removes encrypted remote backups, Let's Encrypt certificates, or packages installed through `apt`. Verify remote backups are readable before purging local data.

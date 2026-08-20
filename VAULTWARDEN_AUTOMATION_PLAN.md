@@ -17,6 +17,7 @@ The implementation should use a single strict Bash entry point, supported by a s
 project/
 ├── vw-deploy.sh                 # Interactive fresh/restore provisioner
 ├── vw-backup.sh                 # Consistent backup helper
+├── vw-uninstall.sh              # Conservative deployment removal helper
 ├── templates/
 │   ├── compose.yml
 │   ├── nginx.conf
