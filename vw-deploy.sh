@@ -1173,18 +1173,12 @@ generate_admin_hash() {
     fi
 
     [[ -t 0 ]] || die 'an interactive terminal is required to create the admin token'
-    local password confirmation output hash
+    local output hash
     printf '\n[NEW VPS] Vaultwarden admin-panel password\n'
     printf 'This is only for the /admin page. Existing users keep their current email addresses and master passwords.\n'
-    read -r -s -p 'New admin-panel password: ' password
-    printf '\n'
-    read -r -s -p 'Repeat new admin-panel password: ' confirmation
-    printf '\n'
-    [[ -n "$password" && "$password" == "$confirmation" ]] || die 'admin passwords do not match'
-    output=$(printf '%s\n%s\n' "$password" "$confirmation" | \
-        docker run --rm -i --entrypoint /vaultwarden "$VAULTWARDEN_IMAGE" hash 2>/dev/null)
-    unset password confirmation
-    hash=$(printf '%s\n' "$output" | awk '/^\$argon2(id|i|d)\$/ { print; exit }')
+    printf 'Vaultwarden will ask for the password twice without echoing it.\n'
+    output=$(docker run --rm -it --entrypoint /vaultwarden "$VAULTWARDEN_IMAGE" hash)
+    hash=$(printf '%s\n' "$output" | awk '/^\$argon2(id|i|d)\$/ { sub(/\r$/, ""); print; exit }')
     [[ "$hash" =~ ^\$argon2(id|i|d)\$ ]] || die 'Vaultwarden did not produce an Argon2 hash'
     ADMIN_TOKEN_HASH=$hash
 }

@@ -212,7 +212,7 @@ sudo ./vw-deploy.sh \
   --retention 30
 ```
 
-The admin password is entered twice without echoing. The script passes it through standard input to the selected Vaultwarden image's hash command and stores only the resulting Argon2 hash. The plaintext password is not written to a file or passed as a command-line argument.
+The admin password is entered twice without echoing by the selected Vaultwarden image's TTY-backed hash command. The script stores only the resulting Argon2 hash. The plaintext password is not written to a file, piped through standard input, or passed as a command-line argument.
 
 The fresh-install flow:
 
