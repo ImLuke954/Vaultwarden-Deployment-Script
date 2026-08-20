@@ -933,6 +933,7 @@ EOF
 }
 
 install_fail2ban() {
+    local attempt
     [[ -f "$SCRIPT_DIR/templates/fail2ban/filter.d/vaultwarden.conf" ]] || \
         die 'Vaultwarden Fail2Ban filter is missing'
     [[ -f "$SCRIPT_DIR/templates/fail2ban/filter.d/vaultwarden-admin.conf" ]] || \
@@ -953,6 +954,13 @@ install_fail2ban() {
     write_fail2ban_jail
     fail2ban-client -t >/dev/null || die 'Fail2Ban configuration validation failed'
     systemctl enable --now fail2ban
+    for attempt in {1..30}; do
+        if fail2ban-client ping >/dev/null 2>&1; then
+            break
+        fi
+        [[ "$attempt" -eq 30 ]] && die 'Fail2Ban did not become ready; inspect journalctl -u fail2ban'
+        sleep 1
+    done
     fail2ban-client reload >/dev/null
     fail2ban-client status vaultwarden >/dev/null || die 'Vaultwarden Fail2Ban jail is not available'
     fail2ban-client status vaultwarden-admin >/dev/null || die 'Vaultwarden admin Fail2Ban jail is not available'
